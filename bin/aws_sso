@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# AWS SSO helpers: log in to an SSO session, open the AWS console in a
+# browser, or export a profile's credentials into the current shell.
+#
+# Works under both zsh and bash, either executed as a script or sourced.
+# Sourcing with no arguments just defines the functions, which makes it
+# safe to source from ~/.zshrc or ~/.bashrc:
+#
+#   . /path/to/aws_sso
+#
+# That defines aws_sso_login, aws_sso_console and aws_sso_export. The login
+# is deliberately not named `aws_sso`, so that sourcing this file does not
+# shadow the script itself if it is installed on $PATH as `aws_sso`.
+#
+# Note that `export` mode has to be sourced to affect the calling shell.
+#
+# Browser: URLs are opened with $BROWSER if set, else `open` / `xdg-open` /
+# `wslview`. The opener gets the URL as its only argument, plus the
+# sso-session name in AWS_SSO_SESSION, so a custom $BROWSER script can route
+# per session. Ordinary browsers ignore the variable.
+
+_aws_sso_usage() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local self="${_AWS_SSO_NAME:-aws_sso}"
+
+  cat <<USAGE
+Usage: $self [command | sso-session] [args...]
+
+Commands:
+  console, -c [profile]  Open the AWS console in a browser, federating in with
+                         PROFILE's credentials (default: \$AWS_PROFILE).
+  export,  -e [profile]  Export PROFILE's credentials into the calling shell
+                         (default: \$AWS_PROFILE). A subprocess cannot set
+                         variables in its parent, so source or eval this:
+                           . $self export [profile]
+                           eval "\$($self export [profile])"
+  login,   -l [session]  Log in to SESSION (default: resolved from
+                         \$AWS_PROFILE). Same as giving the sso-session name
+                         on its own.
+  help,    -h            Show this help.
+
+Arguments after PROFILE are passed to 'aws sso login' if the SSO token has to
+be refreshed, and ignored if it is still valid. An argument starting with '-'
+is never read as a profile or sso-session name, so 'console --no-browser'
+still uses \$AWS_PROFILE.
+
+When sourced, these are also available as shell functions:
+  aws_sso_login [sso-session]  aws_sso_console [profile]  aws_sso_export [profile]
+
+Any other first argument is treated as an sso-session name to log in to, and
+remaining arguments are passed through to 'aws sso login'; 'login' is the
+explicit spelling of the same thing. With no arguments the sso-session is
+resolved from \$AWS_PROFILE.
+
+Examples:
+USAGE
+
+  printf '  %-38s %s\n' \
+    "$self" "log in, session from \$AWS_PROFILE" \
+    "$self corp" "log in to sso-session 'corp'" \
+    "$self login corp" "the same, said explicitly" \
+    "$self corp --no-browser" "extra args go to 'aws sso login'" \
+    "$self console my-profile" "open the console as 'my-profile'" \
+    "$self -c my-profile --no-browser" "flags reach a needed login" \
+    ". $self export my-profile" "export creds into this shell"
+
+  echo
+  echo "Requires: aws, jq, curl."
+}
+
+# True if an argument looks like a profile / sso-session name rather than a
+# flag, so that `console --no-browser` does not read the flag as a profile.
+_aws_sso_is_name() {
+  case "${1:-}" in
+    ""|-*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Opens a URL in the user's default browser. Works on macOS ($BROWSER or
+# `open`), Linux ($BROWSER or `xdg-open`) and WSL (`wslview`).
+#
+# The opener is always called with the URL as its only argument, so any
+# ordinary browser works. The sso-session name is passed alongside it in
+# AWS_SSO_SESSION, in the environment of the opener process only, which
+# lets a custom $BROWSER script route the URL (say, to a browser container
+# per SSO session) while `open` and `xdg-open` simply ignore it. It may be
+# empty if the session could not be determined.
+_aws_sso_open_url() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local url="${1:-}"
+  local sso_session="${2:-}"
+
+  if [[ -z "$url" ]]; then
+    echo "_aws_sso_open_url: no URL given." >&2
+    return 1
+  fi
+
+  local opener
+  for opener in "${BROWSER:-}" open xdg-open wslview; do
+    [[ -n "$opener" ]] || continue
+    if command -v "$opener" >/dev/null 2>&1; then
+      AWS_SSO_SESSION="$sso_session" "$opener" "$url"
+      return $?
+    fi
+  done
+
+  echo "No URL opener found (tried \$BROWSER, open, xdg-open, wslview). URL was:" >&2
+  echo "$url" >&2
+  return 1
+}
+
+# True if the named profile is configured. Deliberately not part of
+# _aws_sso_is_name: that decides whether an argument is a name or a flag, so
+# a false answer there would silently fall back to $AWS_PROFILE instead of
+# failing, and it is also used for sso-session names, which do not appear in
+# `aws configure list-profiles`. Only called once something has already
+# failed, since it costs an extra `aws` invocation (~250ms).
+_aws_sso_profile_exists() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local profile="${1:-}"
+  [[ -n "$profile" ]] || return 1
+
+  local profiles
+  # if the listing itself fails, say nothing rather than blame the profile
+  profiles=$(aws configure list-profiles 2>/dev/null) || return 0
+
+  command grep -Fqx -- "$profile" <<< "$profiles"
+}
+
+# Resolves the sso_session for a profile, following source_profile chains
+# (e.g. a role-chained profile like `admin` -> `corp-sso-admin` -> sso-session
+# `corp`). Prints the sso_session name, or nothing if none is found anywhere
+# in the chain.
+_aws_sso_resolve_session() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local current_profile="${1:-}"
+  local seen=" "
+  local sso_session
+
+  while [[ -n "$current_profile" ]]; do
+    # guard against source_profile cycles
+    case "$seen" in
+      *" $current_profile "*) return 1 ;;
+    esac
+    seen="${seen}${current_profile} "
+
+    sso_session=$(aws configure get sso_session --profile "$current_profile" 2>/dev/null)
+    if [[ -n "$sso_session" ]]; then
+      printf '%s\n' "$sso_session"
+      return 0
+    fi
+
+    current_profile=$(aws configure get source_profile --profile "$current_profile" 2>/dev/null)
+  done
+
+  return 1
+}
+
+# Prints a profile's credentials in the requested format (`process` or `env`),
+# refreshing an expired SSO token once via aws_sso_login if needed. Credentials
+# to stdout, diagnostics to stderr.
+_aws_sso_credentials() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  if [[ $# -lt 2 ]]; then
+    echo "_aws_sso_credentials: needs a profile and a format." >&2
+    return 1
+  fi
+
+  local profile="$1"
+  local format="$2"
+  shift 2
+  # whatever is left are extra `aws sso login` arguments, used only if the
+  # SSO token actually has to be refreshed below
+  local sso_session creds
+
+  # Error text meaning the SSO token is missing, expired or otherwise
+  # unusable, i.e. `aws sso login` should fix it. Taken from botocore's
+  # SSOError / TokenRetrievalError message templates.
+  local sso_errors='token has expired'
+  sso_errors="$sso_errors|token .* (does not exist|is invalid)"
+  sso_errors="$sso_errors|error loading sso token"
+  sso_errors="$sso_errors|error when retrieving token from sso"
+  sso_errors="$sso_errors|access token from sso"
+  sso_errors="$sso_errors|sso session associated with this profile"
+  sso_errors="$sso_errors|authorization to retrieve an sso token"
+  sso_errors="$sso_errors|run aws sso login"
+
+  if ! creds=$(aws configure export-credentials --profile "$profile" --format "$format" 2>&1); then
+    if ! command grep -Eqi "$sso_errors" <<< "$creds"; then
+      echo "export-credentials failed:" >&2
+      echo "$creds" >&2
+      if ! _aws_sso_profile_exists "$profile"; then
+        echo "'$profile' is not a configured profile; see: aws configure list-profiles" >&2
+      fi
+      return 1
+    fi
+
+    sso_session=$(_aws_sso_resolve_session "$profile")
+
+    if [[ -z "$sso_session" ]]; then
+      echo "export-credentials failed with an SSO error, but no sso_session could be" >&2
+      echo "resolved for profile '$profile':" >&2
+      echo "$creds" >&2
+      if ! _aws_sso_profile_exists "$profile"; then
+        echo "'$profile' is not a configured profile; see: aws configure list-profiles" >&2
+      fi
+      return 1
+    fi
+
+    echo "SSO token expired/invalid for session '$sso_session'; logging in again..." >&2
+    # stdout is the credentials here, so keep the login's chatter on stderr
+    if ! aws_sso_login "$sso_session" "$@" >&2; then
+      echo "aws_sso_login failed to refresh session '$sso_session'." >&2
+      return 1
+    fi
+
+    if ! creds=$(aws configure export-credentials --profile "$profile" --format "$format" 2>&1); then
+      echo "export-credentials failed after refreshing SSO token:" >&2
+      echo "$creds" >&2
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$creds"
+}
+
+# Prints a profile's credentials as shell `export` lines, for eval.
+_aws_sso_export_env() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local profile
+  if _aws_sso_is_name "${1:-}"; then
+    profile="$1"
+    shift
+  else
+    profile="${AWS_PROFILE:-}"
+  fi
+
+  if [[ -z "$profile" ]]; then
+    echo "No profile given and AWS_PROFILE is not set." >&2
+    return 1
+  fi
+
+  _aws_sso_credentials "$profile" env "$@"
+}
+
+# Logs in to an AWS SSO session. Takes the sso-session name, or resolves it
+# from $AWS_PROFILE. Extra arguments are passed through to `aws sso login`.
+aws_sso_login() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local sso_session
+  if _aws_sso_is_name "${1:-}"; then
+    sso_session="$1"
+    shift
+  else
+    sso_session=$(_aws_sso_resolve_session "${AWS_PROFILE:-}")
+  fi
+
+  if [[ -z "$sso_session" ]]; then
+    echo "No sso-session given, and none resolved from AWS_PROFILE ('${AWS_PROFILE:-unset}')." >&2
+    if [[ -n "${AWS_PROFILE:-}" ]] && ! _aws_sso_profile_exists "${AWS_PROFILE}"; then
+      echo "'${AWS_PROFILE}' is not a configured profile; see: aws configure list-profiles" >&2
+    fi
+    return 1
+  fi
+
+  # `aws sso login` opens the OIDC URL itself via $BROWSER, so export the
+  # session for that browser process too
+  AWS_SSO_SESSION="$sso_session" aws sso login --sso-session "$sso_session" "$@"
+}
+
+# Exports a profile's credentials into the current shell as
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN.
+aws_sso_export() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local creds_env
+  creds_env=$(_aws_sso_export_env "$@") || return 1
+
+  eval "$creds_env"
+}
+
+# Opens the AWS console in a browser, federating in with a profile's
+# current credentials. Handles both the aws and aws-us-gov partitions.
+aws_sso_console() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local profile
+  if _aws_sso_is_name "${1:-}"; then
+    profile="$1"
+    shift
+  else
+    profile="${AWS_PROFILE:-}"
+  fi
+
+  if [[ -z "$profile" ]]; then
+    echo "No profile given and AWS_PROFILE is not set." >&2
+    return 1
+  fi
+
+  local creds
+  creds=$(_aws_sso_credentials "$profile" process "$@") || return 1
+
+  if ! jq -e . >/dev/null 2>&1 <<< "$creds"; then
+    echo "export-credentials did not return valid JSON:" >&2
+    echo "$creds" >&2
+    return 1
+  fi
+
+  local access_key secret_key session_token
+  access_key=$(jq -r '.AccessKeyId' <<< "$creds")
+  secret_key=$(jq -r '.SecretAccessKey' <<< "$creds")
+  session_token=$(jq -r '.SessionToken' <<< "$creds")
+
+  local caller_arn
+  if ! caller_arn=$(aws sts get-caller-identity --profile "$profile" --query Arn --output text 2>&1); then
+    echo "get-caller-identity failed:" >&2
+    echo "$caller_arn" >&2
+    return 1
+  fi
+
+  local signin_host console_url
+  case "$caller_arn" in
+    arn:aws-us-gov:*)
+      signin_host="signin.amazonaws-us-gov.com"
+      console_url="https://console.amazonaws-us-gov.com/"
+      ;;
+    arn:aws:*)
+      signin_host="signin.aws.amazon.com"
+      console_url="https://console.aws.amazon.com/"
+      ;;
+    *)
+      echo "Unrecognized ARN partition in: $caller_arn" >&2
+      return 1
+      ;;
+  esac
+
+  local session_json federation_response signin_token destination login_url
+  session_json=$(jq -n \
+    --arg sid "$access_key" \
+    --arg key "$secret_key" \
+    --arg tok "$session_token" \
+    '{sessionId: $sid, sessionKey: $key, sessionToken: $tok}')
+
+  federation_response=$(curl -s "https://${signin_host}/federation" \
+    --data-urlencode "Action=getSigninToken" \
+    --data-urlencode "Session=$session_json")
+
+  if ! signin_token=$(jq -re '.SigninToken' <<< "$federation_response" 2>/dev/null); then
+    echo "Failed to get SigninToken from federation endpoint. Response was:" >&2
+    echo "$federation_response" >&2
+    return 1
+  fi
+
+  destination=$(jq -rn --arg url "$console_url" '$url | @uri')
+  login_url="https://${signin_host}/federation?Action=login&Issuer=cli&Destination=${destination}&SigninToken=${signin_token}"
+
+  # Only resolve the session when a custom opener might act on it: `open`
+  # and `xdg-open` ignore the environment, so default setups should not pay
+  # for the extra `aws configure get` calls.
+  local sso_session=""
+  if [[ -n "${BROWSER:-}" ]]; then
+    sso_session=$(_aws_sso_resolve_session "$profile")
+  fi
+
+  _aws_sso_open_url "$login_url" "$sso_session"
+}
+
+# Dispatches a command line to one of the functions above. Prints usage to
+# stderr if the chosen command fails.
+_aws_sso_main() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local rc=0
+
+  case "${1:-}" in
+    -h|--help|help)
+      _aws_sso_usage
+      return 0
+      ;;
+    -c|console)
+      shift
+      aws_sso_console "$@" || rc=$?
+      ;;
+    -e|export)
+      shift
+      if [[ "${_AWS_SSO_SOURCED:-0}" -eq 1 ]]; then
+        aws_sso_export "$@" || rc=$?
+      elif [ ! -t 1 ]; then
+        # Running as a subprocess with stdout captured, i.e. the caller is
+        # already doing `eval "$(... export)"`. Just hand over the creds.
+        _aws_sso_export_env "$@" || rc=$?
+      else
+        # Running as a subprocess straight to a terminal, so an `export`
+        # here would die with the script. Print the credentials anyway, but
+        # say how to actually get them into the calling shell.
+        local self="${_AWS_SSO_SELF:-aws_sso}"
+        local args_hint=""
+        [[ $# -gt 0 ]] && args_hint=" $*"
+        echo "Not sourced, so credentials cannot be set in the calling shell." >&2
+        echo "Use: . $self export$args_hint" >&2
+        echo "or:  eval \"\$($self export$args_hint)\"" >&2
+        _aws_sso_export_env "$@" || rc=$?
+      fi
+      ;;
+    -l|login)
+      # explicit spelling of the default case below
+      shift
+      aws_sso_login "$@" || rc=$?
+      ;;
+    *)
+      aws_sso_login "$@" || rc=$?
+      ;;
+  esac
+
+  if [[ "$rc" -ne 0 ]]; then
+    _aws_sso_usage >&2
+  fi
+
+  return "$rc"
+}
+
+# Am I being sourced or executed?
+if [ -n "${ZSH_VERSION:-}" ]; then
+  case "${ZSH_EVAL_CONTEXT:-}" in
+    *file*) _AWS_SSO_SOURCED=1 ;;
+    *) _AWS_SSO_SOURCED=0 ;;
+  esac
+  _AWS_SSO_SELF="${${(%):-%x}:-aws_sso}"
+  _AWS_SSO_NAME="${_AWS_SSO_SELF##*/}"
+else
+  case "${BASH_SOURCE[0]:-$0}" in
+    "$0") _AWS_SSO_SOURCED=0 ;;
+    *) _AWS_SSO_SOURCED=1 ;;
+  esac
+  _AWS_SSO_SELF="${BASH_SOURCE[0]:-aws_sso}"
+  _AWS_SSO_NAME="${_AWS_SSO_SELF##*/}"
+fi
+
+# Executed: always dispatch. Sourced: dispatch only if given arguments, so
+# that a bare `. aws_sso` from a shell rc file just defines the functions.
+if [[ "$_AWS_SSO_SOURCED" -eq 0 ]] || [[ $# -gt 0 ]]; then
+  _aws_sso_main "$@"
+fi
+

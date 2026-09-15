@@ -1,0 +1,139 @@
+#compdef aws_sso
+
+_aws_sso_config_sections() {
+  setopt localoptions extendedglob
+
+  local kind=$1
+  local config=${AWS_CONFIG_FILE:-${HOME}/.aws/config}
+  local line
+
+  [[ -r $config ]] || return 1
+
+  for line in ${(f)"$(<$config)"}; do
+    if [[ $line = (#b)[[:blank:]]#\[[[:blank:]]#${kind}[[:blank:]]##([^]]##)\]* ]]; then
+      print -r -- ${match[1]%%[[:blank:]]#}
+    elif [[ ${kind} = profile && $line = [[:blank:]]#\[[[:blank:]]#default[[:blank:]]#\]* ]]; then
+      print -r -- default
+    fi
+  done
+}
+
+# Profile names that appear as another profile's source_profile. These are the
+# intermediate SSO profiles in a role-chain; the chained profile is what you
+# actually use, so they are filtered out of profile completion.
+_aws_sso_config_source_profiles() {
+  setopt localoptions extendedglob
+
+  local config=${AWS_CONFIG_FILE:-${HOME}/.aws/config}
+  local line
+
+  [[ -r $config ]] || return 1
+
+  for line in ${(f)"$(<$config)"}; do
+    if [[ $line = (#b)[[:blank:]]#source_profile[[:blank:]]#=[[:blank:]]#([^[:blank:]]##)* ]]; then
+      print -r -- $match[1]
+    fi
+  done
+}
+
+_aws_sso_profiles() {
+  local -a profiles sourced
+  profiles=( ${(f)"$(_aws_sso_config_sections profile)"} )
+
+  if [[ ${AWS_SSO_NO_SOURCE_PROFILES:-} == 1 ]]; then
+    sourced=( ${(f)"$(_aws_sso_config_source_profiles)"} )
+    profiles=( ${profiles:|sourced} )
+  fi
+
+  profiles=( ${profiles:#} )
+  (( $#profiles )) || return 1
+  _describe -t profiles 'profile' profiles
+}
+
+_aws_sso_sessions() {
+  local -a sessions
+  sessions=( ${(f)"$(_aws_sso_config_sections sso-session)"} )
+  sessions=( ${sessions:#} )
+  (( $#sessions )) || return 1
+  _describe -t sso-sessions 'sso-session' sessions
+}
+
+_aws_sso_commands() {
+  local -a disp mats
+
+  # A leading '-' rules out the long spellings, so offer the short ones on
+  # their own rather than adding a second, undescribed group.
+  if [[ -prefix -* ]]; then
+    disp=(
+      '-c:open the AWS console in a browser as AWS_PROFILE'
+      '-e:export AWS_PROFILE credentials to shell environment'
+      '-h:show usage'
+      '-l:log in to an sso-session (default if no command provided)'
+    )
+    mats=( -c -e -h -l )
+  else
+    disp=(
+      'console, -c:open the AWS console in a browser as AWS_PROFILE'
+      'export, -e:export AWS_PROFILE credentials to shell environment'
+      'help, -h:show usage'
+      'login, -l:log in to an sso-session (default if no command provided)'
+    )
+    mats=( console export help login )
+  fi
+
+  _describe -t commands 'command' disp mats
+}
+
+# Flags passed through to 'aws sso login'.
+#
+# Whether --sso-session belongs here depends on the command, which _aws_sso
+# tells us in $_aws_sso_argkind: where the argument is a profile, overriding
+# the sso-session logged in through is a real choice; where the argument is
+# the sso-session itself, --sso-session could only contradict it. Read from
+# the caller's local rather than taken as an argument, because _alternative
+# prepends its own options to an action's arguments.
+_aws_sso_login_options() {
+  local -a opts
+  opts=(
+    '--no-browser:print the verification URL instead of opening a browser'
+    '--use-device-code:use the device-code authorization flow'
+  )
+  [[ ${_aws_sso_argkind:-} == profile ]] && opts+=(
+    '--sso-session:override the sso-session name'
+  )
+  _describe -t options 'aws sso login option' opts
+}
+
+_aws_sso() {
+  local ret=1
+  local -a alts
+
+  # Position 1: a command. A bare sso-session name still works, but it is
+  # only completed after 'login' / '-l'.
+  if (( CURRENT == 2 )); then
+    _aws_sso_commands && ret=0
+    return ret
+  fi
+
+  # What this command's argument is, read by _aws_sso_login_options. The
+  # default case is a bare sso-session name, i.e. login spelled without the
+  # command, so it takes login's options too.
+  local _aws_sso_argkind=sso-session
+
+  case $words[2] in
+    help|-h) return 1 ;;
+    login|-l)
+      (( CURRENT == 3 )) && alts+=( 'sso-sessions:sso-session:_aws_sso_sessions' )
+      ;;
+    console|-c|export|-e)
+      _aws_sso_argkind=profile
+      (( CURRENT == 3 )) && alts+=( 'profiles:profile:_aws_sso_profiles' )
+      ;;
+  esac
+
+  alts+=( 'options:option:_aws_sso_login_options' )
+  _alternative $alts && ret=0
+  return ret
+}
+
+_aws_sso "$@"
