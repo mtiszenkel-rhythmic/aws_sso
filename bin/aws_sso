@@ -242,19 +242,69 @@ _aws_sso_region() {
   printf '%s\n' "$region"
 }
 
-# Resolves the sso_session for a profile, following source_profile chains
-# (e.g. a role-chained profile like `admin` -> `corp-sso-admin` -> sso-session
-# `corp`). Prints the sso_session name, or nothing if none is found anywhere
-# in the chain.
+# The profile a credential_process line hands off to, when that line runs
+# aws_sso: `credential_process = aws_sso export --format process <profile>`
+# answers `<profile>`. Prints nothing and returns 1 for a profile with no such
+# line, one that runs something else, or one that names no profile.
+#
+# This is the link between the two halves of the pair that configuration
+# generators write -- the name you use, and the profile behind it holding the
+# SSO settings. Reading it here means that link only has to be stated once, in
+# the line that actually produces the credentials, rather than repeated in a
+# source_profile that nothing else reads.
+_aws_sso_credential_process_profile() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local profile="${1:-}" line cmd noglob=""
+
+  line=$(aws configure get credential_process --profile "$profile" 2>/dev/null) || return 1
+  [[ -n "$line" ]] || return 1
+
+  # Split the line into words. zsh does not word-split unquoted expansions
+  # under its own options, and bash globs them; emulate -L localizes the first
+  # for us, the second has to be switched off and back by hand.
+  [ -n "${ZSH_VERSION:-}" ] && setopt shwordsplit
+  case "$-" in *f*) ;; *) noglob=1 ;; esac
+  set -f
+  # shellcheck disable=SC2086
+  set -- $line
+  [[ -n "$noglob" ]] && set +f
+
+  # A path is fine, but it has to be aws_sso rather than some other helper
+  # whose arguments would mean something else entirely.
+  cmd="${1:-}"
+  case "${cmd##*/}" in
+    aws_sso) shift ;;
+    *) return 1 ;;
+  esac
+
+  case "${1:-}" in
+    export|-e) shift ;;
+    *) return 1 ;;
+  esac
+
+  # reuse the export parser, so --format is understood wherever it sits
+  _aws_sso_parse_format "$@" || return 1
+  set -- "${_AWS_SSO_ARGS[@]}"
+
+  _aws_sso_is_name "${1:-}" || return 1
+  printf '%s\n' "$1"
+}
+
+# Resolves the sso_session for a profile, following whatever supplies its
+# credentials until something names a session: a credential_process running
+# aws_sso, or a source_profile chain (e.g. `admin` -> `corp-sso-admin` ->
+# sso-session `corp`). Prints the sso_session name, or nothing if none is
+# found anywhere along the way.
 _aws_sso_resolve_session() {
   [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
 
   local current_profile="${1:-}"
   local seen=" "
-  local sso_session
+  local sso_session next
 
   while [[ -n "$current_profile" ]]; do
-    # guard against source_profile cycles
+    # guard against cycles, whichever kind of link made them
     case "$seen" in
       *" $current_profile "*) return 1 ;;
     esac
@@ -266,7 +316,19 @@ _aws_sso_resolve_session() {
       return 0
     fi
 
-    current_profile=$(aws configure get source_profile --profile "$current_profile" 2>/dev/null)
+    # credential_process first: it is what actually produces this profile's
+    # credentials. The exception is a profile that also has role_arn, where
+    # the AWS libraries assume the role from source_profile and never run the
+    # process line -- so follow the chain they follow.
+    next=$(_aws_sso_credential_process_profile "$current_profile") || next=""
+    if [[ -n "$next" ]] &&
+       [[ -n "$(aws configure get role_arn --profile "$current_profile" 2>/dev/null)" ]]; then
+      next=""
+    fi
+    [[ -n "$next" ]] ||
+      next=$(aws configure get source_profile --profile "$current_profile" 2>/dev/null)
+
+    current_profile=$next
   done
 
   return 1

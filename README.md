@@ -200,8 +200,7 @@ sso_account_id = 123456789012
 sso_role_name = Admin
 
 [profile admin]                # what you actually use day to day
-credential_process = /Users/you/.local/bin/aws_sso export --format process corp-admin
-source_profile = corp-admin    # not for credentials; see below
+credential_process = aws_sso export --format process corp-admin
 region = us-east-1
 ```
 
@@ -223,8 +222,7 @@ source_profile = corp-sso-admin
 role_arn = arn:aws:iam::210987654321:role/Admin
 
 [profile admin]
-credential_process = /Users/you/.local/bin/aws_sso export --format process admin-role
-source_profile = admin-role
+credential_process = aws_sso export --format process admin-role
 ```
 
 Four things worth knowing:
@@ -237,12 +235,17 @@ outright, the SSO keys win; and a line naming the profile it is set on calls
 `credential_process` again. `aws_sso` stops that with an error rather than
 recursing, but the fix is a separate profile either way.
 
-**Keep the `source_profile` breadcrumb.** Without a `role_arn` beside it, it
-is inert as far as the AWS libraries are concerned — they use
-`credential_process` and never look at it. It is how `aws_sso` itself finds
-the sso-session when `$AWS_PROFILE` names this profile, so bare `aws_sso`,
-`aws_sso login` and `aws_sso console` keep working. Leave it out and they
-report `No sso-session given, and none resolved from AWS_PROFILE`.
+**Nothing else to keep in step.** `aws_sso` reads the `credential_process`
+line itself to find the profile behind this one, and follows that profile's
+`sso_session` or `source_profile` chain to the session — so bare `aws_sso`,
+`aws_sso login` and `aws_sso console` work with `$AWS_PROFILE` set to a
+`credential_process` profile, without the link being written down twice.
+
+It only reads a line that runs `aws_sso` (by any path); a `credential_process`
+pointing at some other helper is left alone, since its arguments would mean
+something else. A profile with `role_arn` beside `credential_process` is
+followed through `source_profile` instead, matching what the AWS libraries
+themselves do with it.
 
 **Mind how the command is resolved.** The AWS libraries run
 `credential_process` without a shell. That means no shell *syntax*:
