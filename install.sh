@@ -22,12 +22,15 @@ BEGIN_MARK='# >>> aws_sso >>>'
 END_MARK='# <<< aws_sso <<<'
 FPATH_MARK='# added by the aws_sso installer'
 PATH_MARK='# added by the aws_sso installer (system-wide install)'
+COMPLETION_MARK='# added by the aws_sso installer (completion)'
 
 DRY_RUN=0
 FORCE=0
 ASSUME_YES=0
 # -1 until decided: --system / --user, else the prompt in choose_install_dir
 SYSTEM_WIDE=-1
+# -1 until decided: --hide-plumbing / --show-plumbing, else asked
+HIDE_PLUMBING=-1
 # `sudo` once we are writing outside $HOME
 PRIV=""
 TARGET_SHELL=""
@@ -113,6 +116,8 @@ Options:
   -n, --dry-run        report what would change without changing anything
       --system         install to $SYSTEM_BIN_DIR without asking (needs sudo)
       --user           install to $(tilde "$USER_BIN_DIR") without asking
+      --hide-plumbing  set AWS_SSO_NO_PLUMBING_PROFILES=1 without asking
+      --show-plumbing  leave completion listing every profile
   -s, --shell SHELL    install for SHELL (zsh or bash) instead of the
                        detected login shell
   -f, --force          write into a plugin directory even if it is a symlink
@@ -129,6 +134,8 @@ while [ $# -gt 0 ]; do
     -n|--dry-run) DRY_RUN=1 ;;
     --system) SYSTEM_WIDE=1 ;;
     --user) SYSTEM_WIDE=0 ;;
+    --hide-plumbing) HIDE_PLUMBING=1 ;;
+    --show-plumbing) HIDE_PLUMBING=0 ;;
     -f|--force) FORCE=1 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -s|--shell)
@@ -497,6 +504,70 @@ choose_install_dir() {
   fi
 }
 
+# Whether completion should leave out plumbing profiles -- the ones that exist
+# only to be reached through another -- by exporting
+# AWS_SSO_NO_PLUMBING_PROFILES=1.
+#
+# Unanswered means yes here, unlike the install location: this writes one line
+# to a shell rc file that the installer is editing anyway, nothing can hang on
+# it, and removing the line undoes it completely.
+choose_hide_plumbing() {
+  [ "$HIDE_PLUMBING" -ge 0 ] && return 0
+
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    HIDE_PLUMBING=1
+    return 0
+  fi
+
+  if ! have_tty; then
+    HIDE_PLUMBING=1
+    return 0
+  fi
+
+  step "completion"
+  info "Some profiles exist only to be reached through another: those named as"
+  info "a source_profile, and those named by a credential_process line."
+  info "Completion can leave both out and offer only the profiles you would"
+  info "actually set AWS_PROFILE to."
+  if ask_tty "  Hide them from completion? [Y/n] "; then
+    case "$ANSWER" in
+      [nN]|[nN][oO]) HIDE_PLUMBING=0 ;;
+      *) HIDE_PLUMBING=1 ;;
+    esac
+  else
+    HIDE_PLUMBING=1
+    info "nothing answered that; taking the default and hiding them"
+  fi
+
+  [ "$HIDE_PLUMBING" -eq 0 ] && note "Completion will keep listing every profile. To hide just one kind, put
+    either of these in your shell rc file yourself:
+        export AWS_SSO_NO_SOURCE_PROFILES=1      # only ones used as a source_profile
+        export AWS_SSO_NO_CRED_PROC_PROFILES=1   # only ones named by a credential_process
+    AWS_SSO_NO_PLUMBING_PROFILES=1 is the two together, which is what this
+    installer offers."
+
+  return 0
+}
+
+# Exports AWS_SSO_NO_PLUMBING_PROFILES=1 from the shell rc file, which is where
+# the completion reads it from.
+ensure_no_plumbing_profiles() {
+  local file=$1
+  local staged="$TMP_ROOT/noplumb.$$"
+  local src=$file
+
+  if [ -f "$file" ] && grep -Eq '^[^#]*AWS_SSO_NO_PLUMBING_PROFILES=' "$file"; then
+    skip "already set  AWS_SSO_NO_PLUMBING_PROFILES in $(tilde "$file")"
+    return 0
+  fi
+
+  [ -f "$src" ] || src=/dev/null
+  { cat "$src"
+    printf '\n%s\nexport AWS_SSO_NO_PLUMBING_PROFILES=1\n' "$COMPLETION_MARK"
+  } > "$staged"
+  replace_file "$file" "$staged" || skip "unchanged   $(tilde "$file")"
+}
+
 install_script() {
   step "aws_sso script"
   install_file "$SRC_DIR/bin/aws_sso" "$BIN_DIR/aws_sso" 755 "$PRIV"
@@ -781,6 +852,7 @@ install_zsh() {
   fi
 
   [ "$SYSTEM_WIDE" -eq 1 ] && ensure_system_bin_on_path "$zshrc"
+  [ "$HIDE_PLUMBING" -eq 1 ] && ensure_no_plumbing_profiles "$zshrc"
 
   note "Start a new zsh, or run: exec zsh"
 }
@@ -884,6 +956,7 @@ BLOCK
   fi
 
   [ "$SYSTEM_WIDE" -eq 1 ] && ensure_system_bin_on_path "$bashrc"
+  [ "$HIDE_PLUMBING" -eq 1 ] && ensure_no_plumbing_profiles "$bashrc"
 
   note "Start a new bash, or run: exec bash"
 }
@@ -941,6 +1014,7 @@ main() {
   [ "$DRY_RUN" -eq 1 ] && step "dry run: nothing will be written"
 
   choose_install_dir
+  choose_hide_plumbing
   install_script
 
   case "$shell" in

@@ -133,6 +133,8 @@ eval "$(aws_sso export my-profile)"
 -n, --dry-run        report what would change without changing anything
     --system         install to /usr/local/bin without asking (needs sudo)
     --user           install to ~/.local/bin without asking
+    --hide-plumbing  set AWS_SSO_NO_PLUMBING_PROFILES=1 without asking
+    --show-plumbing  leave completion listing every profile
 -s, --shell SHELL    install for zsh or bash instead of the detected login shell
 -f, --force          write into a plugin directory even if it is a symlink
 -y, --yes            install missing dependencies with Homebrew without asking
@@ -303,14 +305,33 @@ container. Ordinary browsers ignore the variable.
 ### Completion
 
 Profile completion lists every profile in `~/.aws/config` (or
-`$AWS_CONFIG_FILE`). If you use role chaining, the intermediate SSO profiles
-are noise; set
+`$AWS_CONFIG_FILE`). Many of those exist only to be reached through another
+one and are never what you set `AWS_PROFILE` to, so three variables control
+how much of that plumbing is offered:
 
-```sh
-export AWS_SSO_NO_SOURCE_PROFILES=1
+| | hides |
+|---|---|
+| `AWS_SSO_NO_PLUMBING_PROFILES=1` | both of the below |
+| `AWS_SSO_NO_SOURCE_PROFILES=1` | profiles named as another profile's `source_profile` — the intermediate SSO profiles of a role chain |
+| `AWS_SSO_NO_CRED_PROC_PROFILES=1` | profiles named by a `credential_process` line that runs `aws_sso` — the `<name>-role` half of a pair |
+
+The installer offers to put `export AWS_SSO_NO_PLUMBING_PROFILES=1` in your
+shell rc file, which is usually what you want; `--hide-plumbing` and
+`--show-plumbing` answer that without being asked. The two narrower variables
+are there to set by hand when you want only one kind hidden. Remove the line
+from your rc file to change your mind later.
+
+To give a sense of the difference, on a generated config of 690 profiles:
+
+```
+nothing set                       690 offered
+AWS_SSO_NO_SOURCE_PROFILES=1      643
+AWS_SSO_NO_CRED_PROC_PROFILES=1   369
+AWS_SSO_NO_PLUMBING_PROFILES=1    322   <- just the ones you use
 ```
 
-to hide any profile that appears as another profile's `source_profile`.
+A `credential_process` running something other than `aws_sso` is left alone:
+its arguments would mean something else, so nothing is inferred from them.
 
 ## Using it without the installer
 

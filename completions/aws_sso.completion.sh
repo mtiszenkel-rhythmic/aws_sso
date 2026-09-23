@@ -33,7 +33,7 @@ _aws_sso_comp_sections() {
 
 # Profile names that appear as another profile's source_profile. These are the
 # intermediate SSO profiles in a role-chain; the chained profile is what you
-# actually use, so they are filtered out of profile completion.
+# actually use, so they can be filtered out of profile completion.
 _aws_sso_comp_source_profiles() {
   local config=${AWS_CONFIG_FILE:-$HOME/.aws/config}
 
@@ -48,16 +48,61 @@ _aws_sso_comp_source_profiles() {
   ' "$config"
 }
 
+# Profiles named by a credential_process line that runs aws_sso, i.e. the
+# '<name>-role' half of a pair. Plumbing for the same reason a source_profile
+# is: you set AWS_PROFILE to the profile in front of it, not to this one.
+_aws_sso_comp_cred_proc_profiles() {
+  local config=${AWS_CONFIG_FILE:-$HOME/.aws/config}
+
+  [ -r "$config" ] || return 1
+
+  awk '
+    /^[[:blank:]]*credential_process[[:blank:]]*=/ {
+      sub(/^[^=]*=[[:blank:]]*/, "")
+      n = split($0, w, /[[:blank:]]+/)
+      if (n < 3) next
+
+      # a path is fine, but arguments of some other helper would mean
+      # something else entirely
+      cmd = w[1]
+      sub(/^.*\//, "", cmd)
+      if (cmd != "aws_sso") next
+      if (w[2] != "export" && w[2] != "-e") next
+
+      skip = 0
+      for (i = 3; i <= n; i++) {
+        if (skip) { skip = 0; continue }
+        if (w[i] == "--format") { skip = 1; continue }   # its value is next
+        if (substr(w[i], 1, 1) == "-") continue
+        print w[i]
+        break
+      }
+    }
+  ' "$config"
+}
+
 _aws_sso_comp_profiles() {
-  local profiles sourced profile
+  local profiles hidden
 
   profiles=$(_aws_sso_comp_sections profile) || return 1
 
-  if [ "${AWS_SSO_NO_SOURCE_PROFILES:-}" = 1 ]; then
-    sourced=$(_aws_sso_comp_source_profiles)
-    for profile in $sourced; do
-      profiles=$(printf '%s\n' "$profiles" | grep -Fxv -- "$profile") || true
-    done
+  hidden=""
+  if [ "${AWS_SSO_NO_PLUMBING_PROFILES:-}" = 1 ] || [ "${AWS_SSO_NO_SOURCE_PROFILES:-}" = 1 ]; then
+    hidden="$hidden$(_aws_sso_comp_source_profiles)
+"
+  fi
+  if [ "${AWS_SSO_NO_PLUMBING_PROFILES:-}" = 1 ] || [ "${AWS_SSO_NO_CRED_PROC_PROFILES:-}" = 1 ]; then
+    hidden="$hidden$(_aws_sso_comp_cred_proc_profiles)
+"
+  fi
+
+  # Filter in one pass. A grep per name is fine for a handful of chained
+  # profiles and painful for the hundreds a generated config can have. Blank
+  # lines are dropped first: as a -f pattern an empty line matches everything,
+  # which would hide the entire list.
+  hidden=$(printf '%s\n' "$hidden" | grep -v '^[[:blank:]]*$') || hidden=""
+  if [ -n "$hidden" ]; then
+    profiles=$(printf '%s\n' "$profiles" | grep -Fxv -f <(printf '%s\n' "$hidden")) || true
   fi
 
   printf '%s\n' "$profiles"

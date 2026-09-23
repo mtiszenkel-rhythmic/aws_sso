@@ -20,7 +20,7 @@ _aws_sso_config_sections() {
 
 # Profile names that appear as another profile's source_profile. These are the
 # intermediate SSO profiles in a role-chain; the chained profile is what you
-# actually use, so they are filtered out of profile completion.
+# actually use, so they can be filtered out of profile completion.
 _aws_sso_config_source_profiles() {
   setopt localoptions extendedglob
 
@@ -36,14 +36,56 @@ _aws_sso_config_source_profiles() {
   done
 }
 
+# Profiles named by a credential_process line that runs aws_sso, i.e. the
+# '<name>-role' half of a pair. Plumbing for the same reason a source_profile
+# is: you set AWS_PROFILE to the profile in front of it, not to this one.
+_aws_sso_config_cred_proc_profiles() {
+  setopt localoptions extendedglob
+
+  local config=${AWS_CONFIG_FILE:-${HOME}/.aws/config}
+  local line word
+  local -a words
+  local -i i skip
+
+  [[ -r $config ]] || return 1
+
+  for line in ${(f)"$(<$config)"}; do
+    [[ $line = (#b)[[:blank:]]#credential_process[[:blank:]]#=[[:blank:]]#(*) ]] || continue
+    words=( ${(z)match[1]} )
+    (( $#words >= 3 )) || continue
+    # a path is fine, but another helper's arguments would mean something else
+    [[ ${words[1]:t} == aws_sso ]] || continue
+    [[ ${words[2]} == (export|-e) ]] || continue
+
+    i=3
+    skip=0
+    while (( i <= $#words )); do
+      word=${words[i]}
+      if (( skip )); then
+        skip=0
+      else
+        case $word in
+          --format) skip=1 ;;      # its value is next, and is not the profile
+          -*) ;;
+          *) print -r -- $word; break ;;
+        esac
+      fi
+      (( i++ ))
+    done
+  done
+}
+
 _aws_sso_profiles() {
-  local -a profiles sourced
+  local -a profiles hidden
   profiles=( ${(f)"$(_aws_sso_config_sections profile)"} )
 
-  if [[ ${AWS_SSO_NO_SOURCE_PROFILES:-} == 1 ]]; then
-    sourced=( ${(f)"$(_aws_sso_config_source_profiles)"} )
-    profiles=( ${profiles:|sourced} )
+  if [[ ${AWS_SSO_NO_PLUMBING_PROFILES:-} == 1 || ${AWS_SSO_NO_SOURCE_PROFILES:-} == 1 ]]; then
+    hidden+=( ${(f)"$(_aws_sso_config_source_profiles)"} )
   fi
+  if [[ ${AWS_SSO_NO_PLUMBING_PROFILES:-} == 1 || ${AWS_SSO_NO_CRED_PROC_PROFILES:-} == 1 ]]; then
+    hidden+=( ${(f)"$(_aws_sso_config_cred_proc_profiles)"} )
+  fi
+  (( $#hidden )) && profiles=( ${profiles:|hidden} )
 
   profiles=( ${profiles:#} )
   (( $#profiles )) || return 1
