@@ -61,6 +61,33 @@ die()  { printf '%s\n' "${C_RED}error:${C_RESET} $*" >&2; exit 1; }
 note() { NOTES="$NOTES$1
 "; }
 
+# True if there is a controlling terminal to ask questions on.
+#
+# Deliberately not `[ -t 0 ]`: by the time we run, stdin may have been consumed
+# or redirected by whatever invoked us -- a setup script that ran `brew` first,
+# or a `curl ... | bash` -- while the terminal itself is still right there. A
+# prompt read from an exhausted stdin answers itself with the default, which is
+# how this went wrong before.
+have_tty() { { : >/dev/tty; } 2>/dev/null; }
+
+# Asks $1 on the terminal; the answer lands in $ANSWER. Returns 1 when nobody
+# answered -- no terminal, or the read hit end-of-file -- as opposed to
+# answering with an empty line, which returns 0 and means "take the default".
+#
+# That distinction matters: swallowing EOF and calling it the default is how an
+# unanswered question ends up deciding to install system-wide on its own.
+ask_tty() {
+  ANSWER=""
+  have_tty || return 1
+  printf '%s' "$1" > /dev/tty
+  if ! IFS= read -r ANSWER < /dev/tty; then
+    ANSWER=""
+    printf '\n' > /dev/tty   # nothing was echoed, so close the prompt line
+    return 1
+  fi
+  return 0
+}
+
 # $HOME -> ~ so paths stay readable in the log.
 tilde() { case "$1" in "$HOME"/*) printf '~%s\n' "${1#$HOME}" ;; *) printf '%s\n' "$1" ;; esac; }
 
@@ -422,36 +449,42 @@ rc_var() {
 # use. They are started with launchd's PATH, which has neither ~/.local/bin nor
 # Homebrew on it, so a credential_process naming a bare `aws_sso` resolves only
 # for programs started from a shell.
+# What to install when the question went unanswered. sudo is the deciding
+# factor: if it would stop for a password there is nobody to type it, so a
+# system-wide install would hang exactly where the prompt just did.
+choose_install_dir_unattended() {
+  if sudo -n true 2>/dev/null; then
+    SYSTEM_WIDE=1
+    info "nothing answered that; installing system-wide, since sudo needs no password here"
+  else
+    SYSTEM_WIDE=0
+    note "Installed for your user only: nothing answered the system-wide
+    question, and sudo would have stopped for a password. Pass --system or
+    --user to choose without being asked."
+  fi
+}
+
 choose_install_dir() {
-  local reply
 
   if [ "$SYSTEM_WIDE" -lt 0 ]; then
     if [ "$ASSUME_YES" -eq 1 ]; then
       SYSTEM_WIDE=1
-    elif [ ! -t 0 ]; then
-      # nobody to answer the prompt, and sudo has no terminal to ask for a
-      # password on either -- unless it needs no password at all
-      if sudo -n true 2>/dev/null; then
-        SYSTEM_WIDE=1
-      else
-        SYSTEM_WIDE=0
-        note "Installed for your user only: there was no terminal to confirm a
-    system-wide install on, and sudo would have asked for a password.
-    Re-run with --system to install into $SYSTEM_BIN_DIR."
-      fi
-    else
+    elif have_tty; then
       step "install location"
       info "Installing to $SYSTEM_BIN_DIR lets GUI applications run aws_sso, which"
       info "is what a credential_process in ~/.aws/config needs -- they are started"
       info "with launchd's PATH, and $(tilde "$USER_BIN_DIR") is not on it."
       info "This needs sudo. Answering no installs to $(tilde "$USER_BIN_DIR") instead."
-      printf '%s' "  Install system-wide? [Y/n] "
-      reply=""
-      read -r reply || true
-      case "$reply" in
-        [nN]|[nN][oO]) SYSTEM_WIDE=0 ;;
-        *) SYSTEM_WIDE=1 ;;
-      esac
+      if ask_tty "  Install system-wide? [Y/n] "; then
+        case "$ANSWER" in
+          [nN]|[nN][oO]) SYSTEM_WIDE=0 ;;
+          *) SYSTEM_WIDE=1 ;;
+        esac
+      else
+        choose_install_dir_unattended
+      fi
+    else
+      choose_install_dir_unattended
     fi
   fi
 
@@ -539,14 +572,12 @@ check_dependencies() {
   fi
 
   if [ "$ASSUME_YES" -eq 0 ]; then
-    if [ ! -t 0 ]; then
+    if ! ask_tty "  Install with Homebrew now ($brew_show install$formulae)? [y/N] "; then
       note "Install them with:
     $brew_show install$formulae"
       return 0
     fi
-    printf '%s' "  Install with Homebrew now ($brew_show install$formulae)? [y/N] "
-    reply=""
-    read -r reply || true
+    reply=$ANSWER
     case "$reply" in
       [yY]|[yY][eE][sS]) ;;
       *)
