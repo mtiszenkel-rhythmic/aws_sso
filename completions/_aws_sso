@@ -104,6 +104,25 @@ _aws_sso_login_options() {
   _describe -t options 'aws sso login option' opts
 }
 
+# Flags of 'aws_sso export' itself, as opposed to the ones handed through to
+# 'aws sso login'.
+_aws_sso_export_options() {
+  local -a opts
+  opts=(
+    '--format:credentials as shell exports (env) or as JSON (process)'
+  )
+  _describe -t options 'export option' opts
+}
+
+_aws_sso_formats() {
+  local -a formats
+  formats=(
+    'env:shell export lines, to eval in this shell'
+    'process:JSON, for credential_process in ~/.aws/config'
+  )
+  _describe -t formats 'format' formats
+}
+
 _aws_sso() {
   local ret=1
   local -a alts
@@ -113,6 +132,13 @@ _aws_sso() {
   if (( CURRENT == 2 )); then
     _aws_sso_commands && ret=0
     return ret
+  fi
+
+  # Only export takes --format, so its value needs no test for which command
+  # we are in: nothing else would have put the word there.
+  if [[ $words[CURRENT-1] == --format ]]; then
+    _aws_sso_formats && return 0
+    return 1
   fi
 
   # What this command's argument is, read by _aws_sso_login_options. The
@@ -125,9 +151,14 @@ _aws_sso() {
     login|-l)
       (( CURRENT == 3 )) && alts+=( 'sso-sessions:sso-session:_aws_sso_sessions' )
       ;;
-    console|-c|export|-e)
+    console|-c)
       _aws_sso_argkind=profile
       (( CURRENT == 3 )) && alts+=( 'profiles:profile:_aws_sso_profiles' )
+      ;;
+    export|-e)
+      _aws_sso_argkind=profile
+      (( CURRENT == 3 )) && alts+=( 'profiles:profile:_aws_sso_profiles' )
+      alts+=( 'export-options:option:_aws_sso_export_options' )
       ;;
   esac
 

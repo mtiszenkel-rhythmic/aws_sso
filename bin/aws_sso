@@ -35,6 +35,8 @@ Commands:
                          variables in its parent, so source or eval this:
                            . $self export [profile]
                            eval "\$($self export [profile])"
+                         --format process prints them as JSON instead, the
+                         form credential_process wants in ~/.aws/config.
   login,   -l [session]  Log in to SESSION (default: resolved from
                          \$AWS_PROFILE). Same as giving the sso-session name
                          on its own.
@@ -53,6 +55,15 @@ remaining arguments are passed through to 'aws sso login'; 'login' is the
 explicit spelling of the same thing. With no arguments the sso-session is
 resolved from \$AWS_PROFILE.
 
+Environment:
+  AWS_SSO_LOGIN          on an expired token, 'auto' (default) logs in only
+                         when a terminal is attached, '1' always, '0' never
+  AWS_SSO_LOGIN_TIMEOUT  seconds to wait for a login already under way
+                         elsewhere (default 180)
+  BROWSER                opener for URLs; receives AWS_SSO_SESSION
+  AWS_REGION             region the console opens in, overriding the profile's
+                         (\$AWS_DEFAULT_REGION is honoured next, as the CLI does)
+
 Examples:
 USAGE
 
@@ -63,7 +74,8 @@ USAGE
     "$self corp --no-browser" "extra args go to 'aws sso login'" \
     "$self console my-profile" "open the console as 'my-profile'" \
     "$self -c my-profile --no-browser" "flags reach a needed login" \
-    ". $self export my-profile" "export creds into this shell"
+    ". $self export my-profile" "export creds into this shell" \
+    "$self -e --format process my-profile" "JSON for credential_process"
 
   echo
   echo "Requires: aws, jq, curl."
@@ -75,6 +87,50 @@ _aws_sso_is_name() {
   case "${1:-}" in
     ""|-*) return 1 ;;
     *) return 0 ;;
+  esac
+}
+
+# Splits `--format env` / `--format=process` out of an export argument list.
+#
+# The format lands in $_AWS_SSO_FORMAT and everything else in $_AWS_SSO_ARGS.
+# bash 3.2, still what macOS ships, has no namerefs, so a pair of globals is
+# the only way to hand an argument list back to a caller intact.
+#
+# `aws sso login` has no --format of its own, so taking it from anywhere in the
+# line costs nothing and lets it sit on either side of the profile name.
+_aws_sso_parse_format() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  _AWS_SSO_FORMAT="env"
+  _AWS_SSO_ARGS=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format)
+        if [[ $# -lt 2 ]]; then
+          echo "--format needs a value: env or process." >&2
+          return 1
+        fi
+        _AWS_SSO_FORMAT="$2"
+        shift 2
+        ;;
+      --format=*)
+        _AWS_SSO_FORMAT="${1#--format=}"
+        shift
+        ;;
+      *)
+        _AWS_SSO_ARGS+=( "$1" )
+        shift
+        ;;
+    esac
+  done
+
+  case "$_AWS_SSO_FORMAT" in
+    env|process) return 0 ;;
+    *)
+      echo "Unknown --format '$_AWS_SSO_FORMAT': want env or process." >&2
+      return 1
+      ;;
   esac
 }
 
@@ -112,6 +168,34 @@ _aws_sso_open_url() {
   return 1
 }
 
+# Makes sure the AWS CLI is reachable, looking in the usual install locations
+# if PATH does not already have it.
+#
+# Needed because of credential_process: that runs under whichever process
+# wanted credentials, and a GUI app or launchd job carries launchd's PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin), not a shell's. An absolute path in the
+# config line is enough to find this script, but the `aws` it shells out to --
+# Homebrew's, usually -- is not on that PATH either. Prepending the directory
+# we find also brings jq and curl along, since they live beside it.
+_aws_sso_find_aws() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  command -v aws >/dev/null 2>&1 && return 0
+
+  local dir
+  for dir in /opt/homebrew/bin /usr/local/bin "${HOME:-}/.local/bin" /opt/local/bin; do
+    if [[ -x "$dir/aws" ]]; then
+      PATH="$dir:$PATH"
+      export PATH
+      return 0
+    fi
+  done
+
+  echo "aws: command not found, and not in any of the usual install locations." >&2
+  echo "Install the AWS CLI, or put it on PATH." >&2
+  return 1
+}
+
 # True if the named profile is configured. Deliberately not part of
 # _aws_sso_is_name: that decides whether an argument is a name or a flag, so
 # a false answer there would silently fall back to $AWS_PROFILE instead of
@@ -129,6 +213,33 @@ _aws_sso_profile_exists() {
   profiles=$(aws configure list-profiles 2>/dev/null) || return 0
 
   command grep -Fqx -- "$profile" <<< "$profiles"
+}
+
+# The region the console should open in, resolved the way the AWS CLI resolves
+# it for an API call: $AWS_REGION, then $AWS_DEFAULT_REGION, then the profile's
+# own `region`. A named profile does not inherit the region of [default] -- the
+# CLI does not do that either -- so this prints nothing when none is set, and
+# the caller leaves the region out of the URL rather than inventing one.
+_aws_sso_region() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local profile="${1:-}"
+
+  if [[ -n "${AWS_REGION:-}" ]]; then
+    printf '%s\n' "$AWS_REGION"
+    return 0
+  fi
+
+  if [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
+    printf '%s\n' "$AWS_DEFAULT_REGION"
+    return 0
+  fi
+
+  local region
+  region=$(aws configure get region --profile "$profile" 2>/dev/null) || return 1
+  [[ -n "$region" ]] || return 1
+
+  printf '%s\n' "$region"
 }
 
 # Resolves the sso_session for a profile, following source_profile chains
@@ -161,6 +272,118 @@ _aws_sso_resolve_session() {
   return 1
 }
 
+# True if there is a controlling terminal, i.e. a human who could complete a
+# login. Deliberately not `[ -t 2 ]`: botocore runs a credential_process with
+# both stdout and stderr on pipes, so by that test every interactive `aws s3
+# ls` would look unattended. It leaves the terminal itself attached, which is
+# what this opens. Under cron or CI there is none and the open fails.
+_aws_sso_have_tty() {
+  { : >/dev/tty; } 2>/dev/null
+}
+
+# Refreshes an SSO session's token for a login the caller did not ask for
+# directly: one triggered by an expired token part-way through console/export.
+# Two things separate it from calling aws_sso_login outright.
+#
+# A login needs a human -- it opens a browser and waits. Somewhere nobody is
+# watching (cron, CI, an IDE shelling out to terraform) that is an indefinite
+# hang rather than an error, so by default it only runs when a terminal is
+# attached; $AWS_SSO_LOGIN overrides in either direction.
+#
+# And credential_process is called once per client, so a parallel terraform run
+# can ask a dozen times at once; without a lock that is a dozen browser tabs.
+# One caller logs in, the rest wait for it and then let their own caller retry
+# against the token it fetched.
+#
+# Returns 0 when the token should now be good, whether this call refreshed it
+# or waited for another one to.
+_aws_sso_refresh_session() {
+  [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  local sso_session="$1"
+  shift
+
+  case "${AWS_SSO_LOGIN:-auto}" in
+    1|yes|always) ;;
+    0|no|never)
+      echo "SSO token for session '$sso_session' needs refreshing, but" >&2
+      echo "AWS_SSO_LOGIN=${AWS_SSO_LOGIN} forbids logging in. Run:" >&2
+      echo "  aws_sso login $sso_session" >&2
+      return 1
+      ;;
+    auto)
+      if ! _aws_sso_have_tty; then
+        echo "SSO token for session '$sso_session' needs refreshing, but no terminal is" >&2
+        echo "attached, so a login could only hang. Run this first:" >&2
+        echo "  aws_sso login $sso_session" >&2
+        echo "or set AWS_SSO_LOGIN=1 to attempt it anyway." >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "Unknown AWS_SSO_LOGIN value '${AWS_SSO_LOGIN}': want auto, 1 or 0." >&2
+      return 1
+      ;;
+  esac
+
+  # mkdir is the lock because it is atomic everywhere and macOS has no flock(1).
+  local lock="${TMPDIR:-/tmp}/aws_sso-login-${sso_session}.lock"
+  local waited=0 holder
+
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [[ "$waited" -ge "${AWS_SSO_LOGIN_TIMEOUT:-180}" ]]; then
+      echo "Gave up waiting for another login to session '$sso_session'." >&2
+      echo "If none is running, remove $lock and try again." >&2
+      return 1
+    fi
+    waited=$((waited + 1))
+
+    holder=$(cat "$lock/pid" 2>/dev/null)
+    if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
+      # whoever was logging in is gone; clear the lock and try to take it over
+      rm -rf "$lock" 2>/dev/null
+      continue
+    fi
+
+    sleep 1
+    # the lock went away while its holder was alive, so that login finished
+    # and the token we came for is already there
+    [[ -d "$lock" ]] || return 0
+  done
+
+  # $$ is the shell, not the subshell, when this runs inside $(...) -- which
+  # only makes the staleness check above conservative, never wrong. Cleaning
+  # up on a signal is left to the executed case: sourced, these would be the
+  # calling shell's traps to keep, and a stale lock is the lesser evil.
+  printf '%s\n' "$$" > "$lock/pid" 2>/dev/null
+  local trapped=0
+  if [[ "${_AWS_SSO_SOURCED:-0}" -eq 0 ]]; then
+    trap 'rm -rf "$lock" 2>/dev/null; exit 130' INT
+    trap 'rm -rf "$lock" 2>/dev/null; exit 143' TERM
+    trapped=1
+  fi
+
+  # Where a human can actually see this. stderr is the right answer whenever
+  # it is a terminal, and is left alone then. When it is not, but a terminal
+  # is attached, the caller is something like credential_process holding both
+  # our pipes: say it to the terminal instead, or a browser window opens
+  # unannounced and the device code -- printed by the login, not by us --
+  # never reaches anyone.
+  local rc=0
+  if [ ! -t 2 ] && _aws_sso_have_tty; then
+    echo "SSO token expired/invalid for session '$sso_session'; logging in again..." >/dev/tty
+    aws_sso_login "$sso_session" "$@" >/dev/tty 2>&1 || rc=$?
+  else
+    echo "SSO token expired/invalid for session '$sso_session'; logging in again..." >&2
+    # stdout belongs to the credentials, so keep the login's chatter on stderr
+    aws_sso_login "$sso_session" "$@" >&2 || rc=$?
+  fi
+
+  [[ "$trapped" -eq 1 ]] && trap - INT TERM
+  rm -rf "$lock" 2>/dev/null
+  return "$rc"
+}
+
 # Prints a profile's credentials in the requested format (`process` or `env`),
 # refreshing an expired SSO token once via aws_sso_login if needed. Credentials
 # to stdout, diagnostics to stderr.
@@ -172,12 +395,33 @@ _aws_sso_credentials() {
     return 1
   fi
 
+  _aws_sso_find_aws || return 1
+
   local profile="$1"
   local format="$2"
   shift 2
   # whatever is left are extra `aws sso login` arguments, used only if the
   # SSO token actually has to be refreshed below
   local sso_session creds
+
+  # Profiles already being fetched further up this call chain, space-delimited
+  # and inherited through the export-credentials calls below. Seeing this one
+  # again means its credential_process leads back to itself, directly or around
+  # a longer loop, which otherwise recurses until something runs out.
+  #
+  # It has to be the list rather than a bare flag: `aws` passes its whole
+  # environment to every credential_process it runs, so a flag would also fire
+  # on the perfectly ordinary case of asking aws_sso for a profile whose
+  # credential_process names a *different* one.
+  case "${_AWS_SSO_NESTED:- }" in
+    *" $profile "*)
+      echo "Recursion: profile '$profile' asks aws_sso for the credentials aws_sso is" >&2
+      echo "already fetching for it. A credential_process line has to name the" >&2
+      echo "underlying SSO profile, not the profile the line is set on." >&2
+      return 1
+      ;;
+  esac
+  local nested="${_AWS_SSO_NESTED:- }$profile "
 
   # Error text meaning the SSO token is missing, expired or otherwise
   # unusable, i.e. `aws sso login` should fix it. Taken from botocore's
@@ -191,7 +435,7 @@ _aws_sso_credentials() {
   sso_errors="$sso_errors|authorization to retrieve an sso token"
   sso_errors="$sso_errors|run aws sso login"
 
-  if ! creds=$(aws configure export-credentials --profile "$profile" --format "$format" 2>&1); then
+  if ! creds=$(_AWS_SSO_NESTED="$nested" aws configure export-credentials --profile "$profile" --format "$format" 2>&1); then
     if ! command grep -Eqi "$sso_errors" <<< "$creds"; then
       echo "export-credentials failed:" >&2
       echo "$creds" >&2
@@ -213,14 +457,12 @@ _aws_sso_credentials() {
       return 1
     fi
 
-    echo "SSO token expired/invalid for session '$sso_session'; logging in again..." >&2
-    # stdout is the credentials here, so keep the login's chatter on stderr
-    if ! aws_sso_login "$sso_session" "$@" >&2; then
-      echo "aws_sso_login failed to refresh session '$sso_session'." >&2
+    if ! _aws_sso_refresh_session "$sso_session" "$@"; then
+      echo "Could not refresh SSO session '$sso_session'." >&2
       return 1
     fi
 
-    if ! creds=$(aws configure export-credentials --profile "$profile" --format "$format" 2>&1); then
+    if ! creds=$(_AWS_SSO_NESTED="$nested" aws configure export-credentials --profile "$profile" --format "$format" 2>&1); then
       echo "export-credentials failed after refreshing SSO token:" >&2
       echo "$creds" >&2
       return 1
@@ -230,9 +472,16 @@ _aws_sso_credentials() {
   printf '%s\n' "$creds"
 }
 
-# Prints a profile's credentials as shell `export` lines, for eval.
-_aws_sso_export_env() {
+# Prints a profile's credentials: shell `export` lines to eval (env, the
+# default), or the JSON credential_process reads (process). Takes --format
+# anywhere in the line; what is left is a profile and then `aws sso login`
+# arguments.
+_aws_sso_export_creds() {
   [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  _aws_sso_parse_format "$@" || return 1
+  local format="$_AWS_SSO_FORMAT"
+  set -- "${_AWS_SSO_ARGS[@]}"
 
   local profile
   if _aws_sso_is_name "${1:-}"; then
@@ -247,13 +496,15 @@ _aws_sso_export_env() {
     return 1
   fi
 
-  _aws_sso_credentials "$profile" env "$@"
+  _aws_sso_credentials "$profile" "$format" "$@"
 }
 
 # Logs in to an AWS SSO session. Takes the sso-session name, or resolves it
 # from $AWS_PROFILE. Extra arguments are passed through to `aws sso login`.
 aws_sso_login() {
   [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
+
+  _aws_sso_find_aws || return 1
 
   local sso_session
   if _aws_sso_is_name "${1:-}"; then
@@ -281,8 +532,16 @@ aws_sso_login() {
 aws_sso_export() {
   [ -n "${ZSH_VERSION:-}" ] && emulate -L zsh
 
+  # checked before the credentials are fetched, so a wrong --format costs a
+  # message rather than a browser round-trip
+  _aws_sso_parse_format "$@" || return 1
+  if [[ "$_AWS_SSO_FORMAT" != env ]]; then
+    echo "Setting credentials in this shell needs --format env, not '$_AWS_SSO_FORMAT'." >&2
+    return 1
+  fi
+
   local creds_env
-  creds_env=$(_aws_sso_export_env "$@") || return 1
+  creds_env=$(_aws_sso_export_creds "$@") || return 1
 
   eval "$creds_env"
 }
@@ -326,21 +585,32 @@ aws_sso_console() {
     return 1
   fi
 
-  local signin_host console_url
+  # Without a region in the destination the console lands wherever that
+  # browser was last, which is rarely the region the profile works in.
+  local region
+  region=$(_aws_sso_region "$profile") || region=""
+
+  local signin_host console_host console_url
   case "$caller_arn" in
     arn:aws-us-gov:*)
       signin_host="signin.amazonaws-us-gov.com"
-      console_url="https://console.amazonaws-us-gov.com/"
+      console_host="console.amazonaws-us-gov.com"
       ;;
     arn:aws:*)
       signin_host="signin.aws.amazon.com"
-      console_url="https://console.aws.amazon.com/"
+      console_host="console.aws.amazon.com"
       ;;
     *)
       echo "Unrecognized ARN partition in: $caller_arn" >&2
       return 1
       ;;
   esac
+
+  if [[ -n "$region" ]]; then
+    console_url="https://${console_host}/console/home?region=${region}"
+  else
+    console_url="https://${console_host}/"
+  fi
 
   local session_json federation_response signin_token destination login_url
   session_json=$(jq -n \
@@ -391,12 +661,21 @@ _aws_sso_main() {
       ;;
     -e|export)
       shift
-      if [[ "${_AWS_SSO_SOURCED:-0}" -eq 1 ]]; then
+      if ! _aws_sso_parse_format "$@"; then
+        rc=1
+      elif [[ "$_AWS_SSO_FORMAT" != env ]]; then
+        # output for another program to parse, credential_process above all.
+        # Nothing to set in a shell, and nobody there to read advice about it
+        # -- including the usage below, which would land in the middle of
+        # whatever that program prints.
+        _aws_sso_export_creds "$@" || rc=$?
+        return "$rc"
+      elif [[ "${_AWS_SSO_SOURCED:-0}" -eq 1 ]]; then
         aws_sso_export "$@" || rc=$?
       elif [ ! -t 1 ]; then
         # Running as a subprocess with stdout captured, i.e. the caller is
         # already doing `eval "$(... export)"`. Just hand over the creds.
-        _aws_sso_export_env "$@" || rc=$?
+        _aws_sso_export_creds "$@" || rc=$?
       else
         # Running as a subprocess straight to a terminal, so an `export`
         # here would die with the script. Print the credentials anyway, but
@@ -407,7 +686,7 @@ _aws_sso_main() {
         echo "Not sourced, so credentials cannot be set in the calling shell." >&2
         echo "Use: . $self export$args_hint" >&2
         echo "or:  eval \"\$($self export$args_hint)\"" >&2
-        _aws_sso_export_env "$@" || rc=$?
+        _aws_sso_export_creds "$@" || rc=$?
       fi
       ;;
     -l|login)

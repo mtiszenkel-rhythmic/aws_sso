@@ -7,6 +7,14 @@
 aws_sso() {
   case "${1:-}" in
     -e|export)
+      # --format process is JSON for another program to read, not shell code,
+      # so that one goes straight through instead of into eval
+      case " $* " in
+        *" --format process "*|*" --format=process "*)
+          command aws_sso "$@"
+          return $?
+          ;;
+      esac
       local creds
       # captured separately so a failure propagates: `eval "$(...)"` would
       # report on the text eval ran, not on the command that produced it

@@ -12,17 +12,24 @@ set -euo pipefail
 
 SRC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
-BIN_DIR="$HOME/.local/bin"
+USER_BIN_DIR="$HOME/.local/bin"
+SYSTEM_BIN_DIR="/usr/local/bin"
+BIN_DIR="$USER_BIN_DIR"
 ZSH_SITE_FUNCTIONS="$HOME/.local/share/zsh/site-functions"
 BASH_COMPLETION_DIR="$HOME/.local/share/bash-completion/completions"
 
 BEGIN_MARK='# >>> aws_sso >>>'
 END_MARK='# <<< aws_sso <<<'
 FPATH_MARK='# added by the aws_sso installer'
+PATH_MARK='# added by the aws_sso installer (system-wide install)'
 
 DRY_RUN=0
 FORCE=0
 ASSUME_YES=0
+# -1 until decided: --system / --user, else the prompt in choose_install_dir
+SYSTEM_WIDE=-1
+# `sudo` once we are writing outside $HOME
+PRIV=""
 TARGET_SHELL=""
 TS=$(date +%Y%m%d-%H%M%S)
 TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/aws_sso-install.XXXXXX")
@@ -62,16 +69,23 @@ usage() {
 Usage: ./install.sh [options]
 
 Installs:
-  * $(tilde "$BIN_DIR")/aws_sso
+  * aws_sso, in $SYSTEM_BIN_DIR (system-wide, the default) or
+    $(tilde "$USER_BIN_DIR") (just you)
   * a shell function wrapping it, so 'aws_sso export' can set variables in
     the calling shell
   * tab completion
+
+A system-wide install also puts $SYSTEM_BIN_DIR and Homebrew on the PATH
+launchd gives GUI applications, so they can run aws_sso too -- which is what
+a credential_process in ~/.aws/config needs. It requires sudo.
 
 Where the function and completion go depends on your login shell and on
 whether oh-my-zsh / oh-my-bash is installed; run with --dry-run to see.
 
 Options:
   -n, --dry-run        report what would change without changing anything
+      --system         install to $SYSTEM_BIN_DIR without asking (needs sudo)
+      --user           install to $(tilde "$USER_BIN_DIR") without asking
   -s, --shell SHELL    install for SHELL (zsh or bash) instead of the
                        detected login shell
   -f, --force          write into a plugin directory even if it is a symlink
@@ -86,6 +100,8 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     -n|--dry-run) DRY_RUN=1 ;;
+    --system) SYSTEM_WIDE=1 ;;
+    --user) SYSTEM_WIDE=0 ;;
     -f|--force) FORCE=1 ;;
     -y|--yes) ASSUME_YES=1 ;;
     -s|--shell)
@@ -109,7 +125,7 @@ esac
 _backed_up=" "
 
 backup_file() {
-  local f=$1
+  local f=$1 priv=${2:-}
   case "$_backed_up" in *" $f "*) return 0 ;; esac
   _backed_up="$_backed_up$f "
   [ -f "$f" ] || return 0
@@ -117,14 +133,15 @@ backup_file() {
     info "would back up $(tilde "$f")"
     return 0
   fi
-  cp -p "$f" "$f.aws_sso-$TS.bak"
+  # shellcheck disable=SC2086
+  $priv cp -p "$f" "$f.aws_sso-$TS.bak"
   info "backed up   $(tilde "$f") -> $(tilde "$f.aws_sso-$TS.bak")"
 }
 
 _made_dirs=" "
 
 ensure_dir() {
-  local d=$1
+  local d=$1 priv=${2:-}
   [ -d "$d" ] && return 0
   case "$_made_dirs" in *" $d "*) return 0 ;; esac
   _made_dirs="$_made_dirs$d "
@@ -132,7 +149,8 @@ ensure_dir() {
     info "would create $(tilde "$d")/"
     return 0
   fi
-  mkdir -p "$d"
+  # shellcheck disable=SC2086
+  $priv mkdir -p "$d"
   info "created     $(tilde "$d")/"
 }
 
@@ -166,7 +184,7 @@ path_within() {
 # Copies a packaged file into place, leaving it alone if it is already
 # identical.
 install_file() {
-  local src=$1 dest=$2 mode=${3:-644} real
+  local src=$1 dest=$2 mode=${3:-644} priv=${4:-} real
   # A plugin directory symlinked to this checkout would have us copy the
   # package onto itself, and drop files where the repository does not keep
   # them. Nothing is gained by writing into the source, so don't.
@@ -177,17 +195,18 @@ install_file() {
     REFUSED=$((REFUSED + 1))
     return 0
   fi
-  ensure_dir "$(dirname "$dest")"
+  ensure_dir "$(dirname "$dest")" "$priv"
   if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
     skip "unchanged   $(tilde "$dest")"
     return 0
   fi
   if [ "$DRY_RUN" -eq 1 ]; then
-    info "would install $(tilde "$dest")"
+    info "would install $(tilde "$dest")${priv:+ (with $priv)}"
     return 0
   fi
-  [ -e "$dest" ] && backup_file "$dest"
-  install -m "$mode" "$src" "$dest"
+  [ -e "$dest" ] && backup_file "$dest" "$priv"
+  # shellcheck disable=SC2086
+  $priv install -m "$mode" "$src" "$dest"
   ok "installed   $(tilde "$dest")"
 }
 
@@ -397,9 +416,61 @@ rc_var() {
 
 # ----------------------------------------------------------- the script ----
 
+# Picks between $SYSTEM_BIN_DIR and $USER_BIN_DIR, and sets BIN_DIR and PRIV.
+#
+# System-wide is the default because it is the only one GUI applications can
+# use. They are started with launchd's PATH, which has neither ~/.local/bin nor
+# Homebrew on it, so a credential_process naming a bare `aws_sso` resolves only
+# for programs started from a shell.
+choose_install_dir() {
+  local reply
+
+  if [ "$SYSTEM_WIDE" -lt 0 ]; then
+    if [ "$ASSUME_YES" -eq 1 ]; then
+      SYSTEM_WIDE=1
+    elif [ ! -t 0 ]; then
+      # nobody to answer the prompt, and sudo has no terminal to ask for a
+      # password on either -- unless it needs no password at all
+      if sudo -n true 2>/dev/null; then
+        SYSTEM_WIDE=1
+      else
+        SYSTEM_WIDE=0
+        note "Installed for your user only: there was no terminal to confirm a
+    system-wide install on, and sudo would have asked for a password.
+    Re-run with --system to install into $SYSTEM_BIN_DIR."
+      fi
+    else
+      step "install location"
+      info "Installing to $SYSTEM_BIN_DIR lets GUI applications run aws_sso, which"
+      info "is what a credential_process in ~/.aws/config needs -- they are started"
+      info "with launchd's PATH, and $(tilde "$USER_BIN_DIR") is not on it."
+      info "This needs sudo. Answering no installs to $(tilde "$USER_BIN_DIR") instead."
+      printf '%s' "  Install system-wide? [Y/n] "
+      reply=""
+      read -r reply || true
+      case "$reply" in
+        [nN]|[nN][oO]) SYSTEM_WIDE=0 ;;
+        *) SYSTEM_WIDE=1 ;;
+      esac
+    fi
+  fi
+
+  if [ "$SYSTEM_WIDE" -eq 1 ]; then
+    BIN_DIR=$SYSTEM_BIN_DIR
+    PRIV=sudo
+  else
+    BIN_DIR=$USER_BIN_DIR
+    PRIV=""
+  fi
+}
+
 install_script() {
   step "aws_sso script"
-  install_file "$SRC_DIR/bin/aws_sso" "$BIN_DIR/aws_sso" 755
+  install_file "$SRC_DIR/bin/aws_sso" "$BIN_DIR/aws_sso" 755 "$PRIV"
+
+  # A system-wide install gets $SYSTEM_BIN_DIR added to the rc file further
+  # down, so only the per-user one has anything to report here.
+  [ "$SYSTEM_WIDE" -eq 1 ] && return 0
 
   case ":${PATH}:" in
     *":$BIN_DIR:"*) ;;
@@ -508,6 +579,142 @@ check_dependencies() {
   return 0
 }
 
+# Adds each ':'-separated entry of $2 to the PATH-like value $1, skipping any
+# already there, and prints the result. Appending blindly would make the value
+# grow every time the installer runs.
+path_append() {
+  local value=$1 additions=$2 rest entry
+  rest=$additions
+  while [ -n "$rest" ]; do
+    entry=${rest%%:*}
+    case "$rest" in *:*) rest=${rest#*:} ;; *) rest="" ;; esac
+    [ -n "$entry" ] || continue
+    case ":$value:" in
+      *":$entry:"*) ;;
+      *) if [ -n "$value" ]; then value="$value:$entry"; else value=$entry; fi ;;
+    esac
+  done
+  printf '%s\n' "$value"
+}
+
+# Puts $SYSTEM_BIN_DIR and Homebrew on the PATH launchd hands to GUI
+# applications, so a credential_process naming a bare `aws_sso` resolves for
+# them too -- otherwise they get /usr/bin:/bin:/usr/sbin:/sbin and nothing else.
+#
+# Both spellings are set on purpose: `setenv` applies to applications launched
+# between now and the next reboot, `config user path` is the persistent one and
+# only takes effect after one. Together they cover both sides of that restart.
+configure_launchd_path() {
+  [ "$(uname -s)" = Darwin ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+
+  step "launchd PATH (what GUI applications get)"
+
+  local current wanted new brew brew_prefix aws_bin aws_dir
+  current=$(launchctl getenv PATH 2>/dev/null) || current=""
+
+  # $SYSTEM_BIN_DIR is where aws_sso itself goes. The rest is for the `aws` it
+  # shells out to, which a GUI application has to be able to find as well.
+  wanted=$SYSTEM_BIN_DIR
+
+  brew=$(find_brew) || brew=""
+  if [ -n "$brew" ]; then
+    brew_prefix=$("$brew" --prefix 2>/dev/null) || brew_prefix=""
+    [ -n "$brew_prefix" ] && wanted="$wanted:$brew_prefix/bin"
+  fi
+
+  # Then wherever aws actually is, which is not necessarily either of those:
+  # the AWS installer package uses /usr/local/bin, and people relocate things.
+  # Homebrew's bin is still added above whether or not aws sits in it, since
+  # that is where jq and curl come from.
+  aws_bin=$(command -v aws 2>/dev/null) || aws_bin=""
+  case "$aws_bin" in
+    /*) aws_dir=$(dirname "$aws_bin") ;;
+    *)  aws_dir="" ;;
+  esac
+  if [ -n "$aws_dir" ]; then
+    case ":$wanted:" in
+      *":$aws_dir:"*) ;;
+      *)
+        wanted="$wanted:$aws_dir"
+        info "aws lives in $aws_dir, outside the directories above; adding it"
+        ;;
+    esac
+  fi
+
+  if [ "$wanted" = "$SYSTEM_BIN_DIR" ]; then
+    note "Neither Homebrew nor the aws CLI was found, so only $SYSTEM_BIN_DIR
+    was added to the PATH GUI applications get. Install the AWS CLI, then
+    re-run this installer so its directory is added too."
+  fi
+
+  # With nothing set, launchd hands out the compiled-in default; start from
+  # that rather than from an empty value, or GUI apps lose /usr/bin.
+  if [ -z "$current" ]; then
+    new=$(path_append "/usr/bin:/bin:/usr/sbin:/sbin" "$wanted")
+  else
+    new=$(path_append "$current" "$wanted")
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$new" = "$current" ]; then
+      skip "unchanged   launchctl PATH is already $new"
+    else
+      info "would run   launchctl setenv PATH $new"
+    fi
+    info "would run   sudo launchctl config user path $new"
+    return 0
+  fi
+
+  if [ "$new" = "$current" ]; then
+    skip "unchanged   launchctl PATH"
+  elif launchctl setenv PATH "$new"; then
+    ok "set         launchctl PATH (applications started from now on)"
+  else
+    warn "launchctl setenv PATH failed; GUI applications may not find aws_sso."
+  fi
+
+  # Persistent, and read at boot -- so it is worth writing even when the live
+  # value already matches, since the two are stored separately.
+  if sudo launchctl config user path "$new" >/dev/null 2>&1; then
+    ok "set         launchd user path (persists; applies after a reboot)"
+  else
+    warn "sudo launchctl config user path failed; the PATH above will be lost on reboot."
+  fi
+
+  note "Applications that were already running keep the PATH they started with.
+    Quit and reopen anything that needs aws_sso (or log out and back in)."
+}
+
+# Makes sure $SYSTEM_BIN_DIR is on the PATH of interactive shells too. macOS
+# has it in /etc/paths, so for a login shell this is usually already true and
+# nothing is written; it matters where a rc file sets PATH wholesale.
+ensure_system_bin_on_path() {
+  local file=$1
+  local staged="$TMP_ROOT/syspath.$$"
+  local src=$file
+
+  case ":${PATH}:" in
+    *":$SYSTEM_BIN_DIR:"*)
+      skip "already on  PATH: $SYSTEM_BIN_DIR"
+      return 0
+      ;;
+  esac
+
+  if [ -f "$file" ] && grep -Eq "^[^#]*PATH=.*$SYSTEM_BIN_DIR" "$file"; then
+    skip "already in  $(tilde "$file")"
+    return 0
+  fi
+
+  [ -f "$src" ] || src=/dev/null
+  { cat "$src"
+    # $PATH stays literal on purpose: it is the rc file that expands it
+    # shellcheck disable=SC2016
+    printf '\n%s\nexport PATH="%s:$PATH"\n' "$PATH_MARK" "$SYSTEM_BIN_DIR"
+  } > "$staged"
+  replace_file "$file" "$staged" || skip "unchanged   $(tilde "$file")"
+}
+
 # ------------------------------------------------------------------ zsh ----
 
 install_zsh() {
@@ -541,6 +748,8 @@ install_zsh() {
     zsh_ensure_fpath "$zshrc"
     ensure_block "$zshrc" "$SRC_DIR/aws_sso.plugin.zsh"
   fi
+
+  [ "$SYSTEM_WIDE" -eq 1 ] && ensure_system_bin_on_path "$zshrc"
 
   note "Start a new zsh, or run: exec zsh"
 }
@@ -643,6 +852,8 @@ BLOCK
     ensure_block "$bashrc" "$block"
   fi
 
+  [ "$SYSTEM_WIDE" -eq 1 ] && ensure_system_bin_on_path "$bashrc"
+
   note "Start a new bash, or run: exec bash"
 }
 
@@ -698,6 +909,7 @@ main() {
 
   [ "$DRY_RUN" -eq 1 ] && step "dry run: nothing will be written"
 
+  choose_install_dir
   install_script
 
   case "$shell" in
@@ -711,6 +923,8 @@ main() {
     and see completions/ for the completion definitions."
       ;;
   esac
+
+  [ "$SYSTEM_WIDE" -eq 1 ] && configure_launchd_path
 
   check_dependencies
 

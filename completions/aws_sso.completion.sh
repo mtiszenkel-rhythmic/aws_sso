@@ -64,13 +64,22 @@ _aws_sso_comp_profiles() {
 }
 
 _aws_sso_completion() {
-  local cur cmd
+  local cur prev cmd
 
   COMPREPLY=()
   cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]:-}
   cmd=${COMP_WORDS[1]:-}
 
   local candidates=''
+
+  # Only export takes --format, so its value needs no test for which command
+  # we are in: nothing else would have put the word there.
+  if [ "$COMP_CWORD" -gt 1 ] && [ "$prev" = --format ]; then
+    # shellcheck disable=SC2207
+    COMPREPLY=( $(compgen -W 'env process' -- "$cur") )
+    return 0
+  fi
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     # A leading '-' rules out the long spellings, so offer the short ones
@@ -94,8 +103,13 @@ _aws_sso_completion() {
         [ "$COMP_CWORD" -eq 2 ] &&
           candidates=$(_aws_sso_comp_sections sso-session)
         ;;
-      console|-c|export|-e)
+      console|-c)
         opts="$opts --sso-session"
+        [ "$COMP_CWORD" -eq 2 ] &&
+          candidates=$(_aws_sso_comp_profiles)
+        ;;
+      export|-e)
+        opts="$opts --sso-session --format"
         [ "$COMP_CWORD" -eq 2 ] &&
           candidates=$(_aws_sso_comp_profiles)
         ;;
