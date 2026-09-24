@@ -48,14 +48,13 @@ look before you leap.
 The installer is idempotent — re-run it to upgrade — and backs up any file it
 edits as `<file>.aws_sso-<timestamp>.bak`.
 
-If `~/.local/bin` isn't on your `PATH`, the installer says so at the end. Add
-it yourself:
+Whichever directory the script lands in is added to your `PATH` if it isn't
+there already, and so is the directory holding the `aws` CLI — `aws_sso`
+shells out to it, so a shell that can't find `aws` can't use `aws_sso`. See
+[Which startup file gets what](#which-startup-file-gets-what) for where those
+lines go.
 
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Then start a new shell, or `exec zsh` / `exec bash`.
+Then start a new shell, or `exec zsh` / `exec bash -l`.
 
 ### System-wide install
 
@@ -80,9 +79,9 @@ credentials is a GUI app. So a system-wide install also:
   `launchctl setenv` (applications started from then on) and `sudo launchctl
   config user path` (persistent, read at the next boot); the two are stored
   separately, so both are set to cover either side of a restart;
-- adds `/usr/local/bin` to your shell rc file if it isn't already on your
-  `PATH` — on macOS `/etc/paths` usually has it, in which case nothing is
-  written.
+- adds `/usr/local/bin` to your shell's own `PATH` if it isn't there already —
+  on macOS `/etc/paths` usually has it, in which case nothing is written. A
+  `--user` install does the same for `~/.local/bin`.
 
 Existing components are kept and only what's missing is appended, so
 re-running the installer doesn't grow the value.
@@ -105,7 +104,56 @@ framework:
 | zsh | with oh-my-zsh | `$ZSH_CUSTOM/plugins/aws_sso/aws_sso.plugin.zsh`, plus `aws_sso` in `plugins=( … )` | same plugin directory |
 | zsh | without | a managed block in `~/.zshrc` | `~/.local/share/zsh/site-functions/_aws_sso`, added to `fpath` above `compinit` |
 | bash | with oh-my-bash | `$OSH_CUSTOM/plugins/aws_sso/aws_sso.plugin.sh`, plus `aws_sso` in `plugins=( … )` | `$OSH_CUSTOM/completions/aws_sso.completion.sh`, plus `aws_sso` in `completions=( … )` |
-| bash | without | a managed block in `~/.bashrc` | `~/.local/share/bash-completion/completions/aws_sso`, sourced from that block |
+| bash | without | a managed block in your bash login file | `~/.local/share/bash-completion/completions/aws_sso`, sourced from that block |
+
+### Which startup file gets what
+
+**zsh** — everything goes in `~/.zshrc`, which login and interactive shells
+both read. With oh-my-zsh the wrapper and completion live in the plugin
+directory instead, registered from `~/.zshrc`.
+
+**bash** — `~/.bashrc` is *not* read by a login shell, and on macOS every new
+Terminal window is a login shell. So anything that has to be in effect there
+goes in the bash login file: the `PATH` line for wherever `aws_sso` was
+installed, `AWS_SSO_NO_PLUMBING_PROFILES` for completion filtering, and — when
+oh-my-bash is not installed — the managed block with the wrapper function and
+the completion `source` line.
+
+`PATH` lines **append**:
+
+```sh
+export PATH="$PATH:$HOME/.local/bin"
+```
+
+`aws_sso` should not be installed anywhere else, and if a copy is, it was put
+there deliberately and should keep winning. Appending also means these lines
+cannot shadow a tool the shell already resolves elsewhere.
+
+Up to two are written — the directory `aws_sso` went into, and the directory
+`aws` is in when that is somewhere your shell can't see. Neither is written if
+the directory is already on your `PATH`, which is the usual outcome for `aws`.
+
+A directory under your home is written as `$HOME/...`, so a synced startup
+file still works on another machine. All four spellings count as already
+present, so nothing is duplicated — whether the line came from a previous run
+or from you:
+
+```sh
+export PATH="$PATH:/Users/you/.local/bin"     # expanded
+export PATH="$PATH:$HOME/.local/bin"
+export PATH="$PATH:${HOME}/.local/bin"
+export PATH=$PATH:~/.local/bin
+```
+
+With oh-my-bash, the wrapper and completion are registered through its plugin
+lists in `~/.bashrc`, which is its own mechanism and left alone; only the two
+exports go in the login file.
+
+Which login file that is follows bash's own precedence: the first of
+`~/.bash_profile`, `~/.bash_login`, `~/.profile` that already exists, and
+`~/.bash_profile` if none does. That matters — creating `~/.bash_profile` on a
+machine whose login file is really `~/.profile` would stop `~/.profile` being
+read at all.
 
 oh-my-zsh and oh-my-bash are found via `$ZSH` / `$OSH`, then via your rc file,
 then at their default locations — so a framework installed somewhere unusual
@@ -316,7 +364,7 @@ how much of that plumbing is offered:
 | `AWS_SSO_NO_CRED_PROC_PROFILES=1` | profiles named by a `credential_process` line that runs `aws_sso` — the `<name>-role` half of a pair |
 
 The installer offers to put `export AWS_SSO_NO_PLUMBING_PROFILES=1` in your
-shell rc file, which is usually what you want; `--hide-plumbing` and
+shell startup file, which is usually what you want; `--hide-plumbing` and
 `--show-plumbing` answer that without being asked. The two narrower variables
 are there to set by hand when you want only one kind hidden. Remove the line
 from your rc file to change your mind later.
@@ -383,7 +431,8 @@ rm -rf "$OSH_CUSTOM/plugins/aws_sso"
 # without a framework
 rm -f ~/.local/share/zsh/site-functions/_aws_sso
 rm -f ~/.local/share/bash-completion/completions/aws_sso
-# and delete the `# >>> aws_sso >>>` … `# <<< aws_sso <<<` block from your rc file
+# and delete the `# >>> aws_sso >>>` … `# <<< aws_sso <<<` block from ~/.zshrc,
+# or from your bash login file (~/.bash_profile, ~/.bash_login or ~/.profile)
 ```
 
 ## Troubleshooting

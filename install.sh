@@ -21,7 +21,7 @@ BASH_COMPLETION_DIR="$HOME/.local/share/bash-completion/completions"
 BEGIN_MARK='# >>> aws_sso >>>'
 END_MARK='# <<< aws_sso <<<'
 FPATH_MARK='# added by the aws_sso installer'
-PATH_MARK='# added by the aws_sso installer (system-wide install)'
+PATH_MARK='# added by the aws_sso installer (PATH)'
 COMPLETION_MARK='# added by the aws_sso installer (completion)'
 
 DRY_RUN=0
@@ -571,18 +571,8 @@ ensure_no_plumbing_profiles() {
 install_script() {
   step "aws_sso script"
   install_file "$SRC_DIR/bin/aws_sso" "$BIN_DIR/aws_sso" 755 "$PRIV"
-
-  # A system-wide install gets $SYSTEM_BIN_DIR added to the rc file further
-  # down, so only the per-user one has anything to report here.
-  [ "$SYSTEM_WIDE" -eq 1 ] && return 0
-
-  case ":${PATH}:" in
-    *":$BIN_DIR:"*) ;;
-    *)
-      note "$(tilde "$BIN_DIR") is not on your PATH. Add this to your shell rc file:
-    export PATH=\"\$HOME/.local/bin:\$PATH\""
-      ;;
-  esac
+  # $BIN_DIR is put on PATH by install_zsh / install_bash, which know which
+  # startup file to write to.
 }
 
 # The Homebrew formula that provides a given command, where the two differ.
@@ -712,7 +702,7 @@ configure_launchd_path() {
 
   step "launchd PATH (what GUI applications get)"
 
-  local current wanted new brew brew_prefix aws_bin aws_dir
+  local current wanted new brew brew_prefix aws_dir
   current=$(launchctl getenv PATH 2>/dev/null) || current=""
 
   # $SYSTEM_BIN_DIR is where aws_sso itself goes. The rest is for the `aws` it
@@ -729,11 +719,7 @@ configure_launchd_path() {
   # the AWS installer package uses /usr/local/bin, and people relocate things.
   # Homebrew's bin is still added above whether or not aws sits in it, since
   # that is where jq and curl come from.
-  aws_bin=$(command -v aws 2>/dev/null) || aws_bin=""
-  case "$aws_bin" in
-    /*) aws_dir=$(dirname "$aws_bin") ;;
-    *)  aws_dir="" ;;
-  esac
+  aws_dir=$(find_aws_dir) || aws_dir=""
   if [ -n "$aws_dir" ]; then
     case ":$wanted:" in
       *":$aws_dir:"*) ;;
@@ -788,31 +774,85 @@ configure_launchd_path() {
     Quit and reopen anything that needs aws_sso (or log out and back in)."
 }
 
-# Makes sure $SYSTEM_BIN_DIR is on the PATH of interactive shells too. macOS
-# has it in /etc/paths, so for a login shell this is usually already true and
-# nothing is written; it matters where a rc file sets PATH wholesale.
-ensure_system_bin_on_path() {
-  local file=$1
-  local staged="$TMP_ROOT/syspath.$$"
+# Makes sure the directory aws_sso went into is on the PATH of interactive
+# shells, by adding a line to $1. Nothing is written when it is already there
+# -- on macOS /usr/local/bin is in /etc/paths, so a system-wide install usually
+# needs no line at all.
+#
+# Appended rather than prepended, deliberately. aws_sso should not be anywhere
+# else, and if a copy is, it was put there on purpose and ought to keep
+# winning. Appending also means this line cannot quietly shadow a tool the
+# shell already resolves somewhere else.
+# The directory holding the aws CLI: from PATH when it is there, otherwise the
+# usual install locations -- the same list aws_sso itself searches at runtime,
+# so the two agree about where aws might be. Prints nothing if it is nowhere.
+find_aws_dir() {
+  local bin dir
+  bin=$(command -v aws 2>/dev/null) || bin=""
+  case "$bin" in
+    /*)
+      dirname "$bin"
+      return 0
+      ;;
+  esac
+  for dir in /opt/homebrew/bin /usr/local/bin "$HOME/.local/bin" /opt/local/bin; do
+    if [ -x "$dir/aws" ]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True if an uncommented PATH= line in $1 already mentions directory $2, in any
+# of the spellings people write for a path under their home directory. $3 is
+# the part after $HOME, empty when the directory is not under it.
+path_line_mentions() {
+  local file=$1 dir=$2 rest=$3
+  local lines
+  lines=$(grep -v '^[[:blank:]]*#' "$file" | grep -F 'PATH=') || return 1
+
+  if [ -n "$rest" ]; then
+    printf '%s\n' "$lines" |
+      grep -qF -e "$dir" -e "\$HOME$rest" -e "\${HOME}$rest" -e "~$rest"
+  else
+    printf '%s\n' "$lines" | grep -qF -e "$dir"
+  fi
+}
+
+ensure_bin_on_path() {
+  local file=$1 dir=$2
+  local staged="$TMP_ROOT/binpath.$$"
   local src=$file
+  # a path under $HOME is written as $HOME/... so a synced rc file still works
+  local written=$dir rest=""
+  case "$dir" in
+    "$HOME"/*)
+      rest=${dir#"$HOME"}
+      written="\$HOME$rest"
+      ;;
+  esac
 
   case ":${PATH}:" in
-    *":$SYSTEM_BIN_DIR:"*)
-      skip "already on  PATH: $SYSTEM_BIN_DIR"
+    *":$dir:"*)
+      skip "already on  PATH: $dir"
       return 0
       ;;
   esac
 
-  if [ -f "$file" ] && grep -Eq "^[^#]*PATH=.*$SYSTEM_BIN_DIR" "$file"; then
+  # Any spelling counts as already done, so a re-run adds nothing and neither
+  # does a line the user wrote by hand: the expanded path, and for a directory
+  # under $HOME also $HOME/..., ${HOME}/... and ~/..., all of which are common.
+  if [ -f "$file" ] && path_line_mentions "$file" "$dir" "$rest"; then
     skip "already in  $(tilde "$file")"
     return 0
   fi
 
   [ -f "$src" ] || src=/dev/null
   { cat "$src"
-    # $PATH stays literal on purpose: it is the rc file that expands it
+    # $PATH and $HOME stay literal on purpose: the rc file expands them
     # shellcheck disable=SC2016
-    printf '\n%s\nexport PATH="%s:$PATH"\n' "$PATH_MARK" "$SYSTEM_BIN_DIR"
+    printf '\n%s\nexport PATH="$PATH:%s"\n' "$PATH_MARK" "$written"
   } > "$staged"
   replace_file "$file" "$staged" || skip "unchanged   $(tilde "$file")"
 }
@@ -821,7 +861,7 @@ ensure_system_bin_on_path() {
 
 install_zsh() {
   local zshrc="$HOME/.zshrc"
-  local omz zsh_custom
+  local omz zsh_custom aws_dir
 
   touch_rc "$zshrc"
 
@@ -851,7 +891,11 @@ install_zsh() {
     ensure_block "$zshrc" "$SRC_DIR/aws_sso.plugin.zsh"
   fi
 
-  [ "$SYSTEM_WIDE" -eq 1 ] && ensure_system_bin_on_path "$zshrc"
+  ensure_bin_on_path "$zshrc" "$BIN_DIR"
+  # aws_sso shells out to aws, so a shell that cannot find aws cannot use it
+  if aws_dir=$(find_aws_dir); then
+    ensure_bin_on_path "$zshrc" "$aws_dir"
+  fi
   [ "$HIDE_PLUMBING" -eq 1 ] && ensure_no_plumbing_profiles "$zshrc"
 
   note "Start a new zsh, or run: exec zsh"
@@ -917,14 +961,19 @@ zsh_ensure_fpath() {
 
 install_bash() {
   local bashrc="$HOME/.bashrc"
-  local osh osh_custom
-
-  touch_rc "$bashrc"
+  local osh osh_custom aws_dir
+  # PATH, exports and -- without a framework -- the wrapper function all go in
+  # the login file; see bash_login_rc.
+  local bash_profile
+  bash_profile=$(bash_login_rc)
 
   osh=$(bash_home "$bashrc") || osh=""
 
   if [ -n "$osh" ]; then
     step "bash (oh-my-bash at $(tilde "$osh"))"
+    # oh-my-bash loads the wrapper from ~/.bashrc through its plugin list,
+    # which is its business; only the exports below are ours to place.
+    touch_rc "$bashrc"
     osh_custom=$(bash_custom "$bashrc" "$osh")
 
     local plugin_dir="$osh_custom/plugins/aws_sso"
@@ -952,13 +1001,38 @@ if [ -r "$HOME/.local/share/bash-completion/completions/aws_sso" ]; then
   . "$HOME/.local/share/bash-completion/completions/aws_sso"
 fi
 BLOCK
-    ensure_block "$bashrc" "$block"
+    # Not ~/.bashrc: a login shell does not read it, and on macOS every new
+    # Terminal window is a login shell, so the wrapper would never be defined.
+    ensure_block "$bash_profile" "$block"
   fi
 
-  [ "$SYSTEM_WIDE" -eq 1 ] && ensure_system_bin_on_path "$bashrc"
-  [ "$HIDE_PLUMBING" -eq 1 ] && ensure_no_plumbing_profiles "$bashrc"
+  ensure_bin_on_path "$bash_profile" "$BIN_DIR"
+  # aws_sso shells out to aws, so a shell that cannot find aws cannot use it
+  if aws_dir=$(find_aws_dir); then
+    ensure_bin_on_path "$bash_profile" "$aws_dir"
+  fi
+  [ "$HIDE_PLUMBING" -eq 1 ] && ensure_no_plumbing_profiles "$bash_profile"
 
-  note "Start a new bash, or run: exec bash"
+  note "Start a new bash, or run: exec bash -l"
+}
+
+# The file bash reads for a *login* shell: the first of ~/.bash_profile,
+# ~/.bash_login and ~/.profile that exists, or ~/.bash_profile when none does.
+#
+# PATH and exported variables belong there rather than in ~/.bashrc, which a
+# login shell does not read -- and on macOS every new Terminal window is a
+# login shell. Following bash's own precedence matters: creating
+# ~/.bash_profile where the login file is really ~/.profile would stop that one
+# from being read at all.
+bash_login_rc() {
+  local candidate
+  for candidate in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf '%s\n' "$HOME/.bash_profile"
 }
 
 bash_home() {
@@ -1022,8 +1096,9 @@ main() {
     bash) install_bash ;;
     *)
       warn "unrecognized login shell '${shell:-unknown}'; installed the script only."
-      note "Only zsh and bash integration is packaged. For another shell, wrap
-    the script yourself so that 'export' reaches your shell:
+      note "Only zsh and bash integration is packaged. For another shell, put
+    $(tilde "$BIN_DIR") on your PATH, wrap the script yourself so that
+    'export' reaches your shell:
         eval \"\$(aws_sso export PROFILE)\"
     and see completions/ for the completion definitions."
       ;;
