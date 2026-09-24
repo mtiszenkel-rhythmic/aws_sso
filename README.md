@@ -78,7 +78,9 @@ credentials is a GUI app. So a system-wide install also:
   and it can be anywhere — to the `PATH` launchd hands out. This is done with
   `launchctl setenv` (applications started from then on) and `sudo launchctl
   config user path` (persistent, read at the next boot); the two are stored
-  separately, so both are set to cover either side of a restart;
+  separately, so both are set to cover either side of a restart. Each is
+  compared before being written, and `sudo` is only used for the second one —
+  so re-running when nothing has changed asks for no password at all;
 - adds `/usr/local/bin` to your shell's own `PATH` if it isn't there already —
   on macOS `/etc/paths` usually has it, in which case nothing is written. A
   `--user` install does the same for `~/.local/bin`.

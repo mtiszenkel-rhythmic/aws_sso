@@ -689,6 +689,21 @@ path_append() {
   printf '%s\n' "$value"
 }
 
+# The PATH `launchctl config user path` last stored. That subcommand is
+# write-only, but the plist behind it is world-readable, so a re-run can tell
+# whether it would change anything -- and not ask for a sudo password when it
+# would not.
+launchd_config_path() {
+  local plist=/var/db/com.apple.xpc.launchd/config/user.plist value
+  [ -r "$plist" ] || return 1
+  value=$(plutil -extract PathEnvironmentVariable raw -o - "$plist" 2>/dev/null) || return 1
+  # a missing key reports an error rather than failing, so check it looks right
+  case "$value" in
+    /*) printf '%s\n' "$value" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Puts $SYSTEM_BIN_DIR and Homebrew on the PATH launchd hands to GUI
 # applications, so a credential_process naming a bare `aws_sso` resolves for
 # them too -- otherwise they get /usr/bin:/bin:/usr/sbin:/sbin and nothing else.
@@ -744,34 +759,53 @@ configure_launchd_path() {
     new=$(path_append "$current" "$wanted")
   fi
 
+  # The live value and the persistent one are stored separately, so they are
+  # compared separately: either can already be right while the other is not.
+  local stored
+  stored=$(launchd_config_path) || stored=""
+
   if [ "$DRY_RUN" -eq 1 ]; then
     if [ "$new" = "$current" ]; then
       skip "unchanged   launchctl PATH is already $new"
     else
       info "would run   launchctl setenv PATH $new"
     fi
-    info "would run   sudo launchctl config user path $new"
+    if [ "$new" = "$stored" ]; then
+      skip "unchanged   launchd user path is already set to that"
+    else
+      info "would run   sudo launchctl config user path $new"
+    fi
     return 0
   fi
+
+  local changed=0
 
   if [ "$new" = "$current" ]; then
     skip "unchanged   launchctl PATH"
   elif launchctl setenv PATH "$new"; then
     ok "set         launchctl PATH (applications started from now on)"
+    changed=1
   else
     warn "launchctl setenv PATH failed; GUI applications may not find aws_sso."
   fi
 
-  # Persistent, and read at boot -- so it is worth writing even when the live
-  # value already matches, since the two are stored separately.
-  if sudo launchctl config user path "$new" >/dev/null 2>&1; then
+  # Only this needs root, so skipping it when it would write the same value is
+  # the difference between a re-run that asks for a password and one that does
+  # not. Nothing else in a system-wide install needs sudo once the script
+  # itself is in place and unchanged.
+  if [ "$new" = "$stored" ]; then
+    skip "unchanged   launchd user path"
+  elif sudo launchctl config user path "$new" >/dev/null 2>&1; then
     ok "set         launchd user path (persists; applies after a reboot)"
+    changed=1
   else
     warn "sudo launchctl config user path failed; the PATH above will be lost on reboot."
   fi
 
-  note "Applications that were already running keep the PATH they started with.
+  [ "$changed" -eq 1 ] && note "Applications that were already running keep the PATH they started with.
     Quit and reopen anything that needs aws_sso (or log out and back in)."
+
+  return 0
 }
 
 # Makes sure the directory aws_sso went into is on the PATH of interactive
