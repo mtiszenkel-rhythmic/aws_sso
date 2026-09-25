@@ -124,8 +124,10 @@ Options:
   -y, --yes            install missing dependencies with Homebrew without asking
   -h, --help           this message
 
-Existing files are backed up as <file>.aws_sso-<timestamp>.bak before being
-edited. Re-running the installer is safe; it updates in place.
+Shell startup files are backed up as <file>.aws_sso-<timestamp>.bak before
+being edited. The script, shell functions and completions are this package's
+own, so they are simply replaced. Re-running the installer is safe; it updates
+in place.
 USAGE
 }
 
@@ -158,8 +160,10 @@ esac
 
 _backed_up=" "
 
+# Keeps a timestamped copy of a file before it is edited. Only startup files
+# reach this: they are the user's, and we rewrite a region inside them.
 backup_file() {
-  local f=$1 priv=${2:-}
+  local f=$1
   case "$_backed_up" in *" $f "*) return 0 ;; esac
   _backed_up="$_backed_up$f "
   [ -f "$f" ] || return 0
@@ -167,8 +171,7 @@ backup_file() {
     info "would back up $(tilde "$f")"
     return 0
   fi
-  # shellcheck disable=SC2086
-  $priv cp -p "$f" "$f.aws_sso-$TS.bak"
+  cp -p "$f" "$f.aws_sso-$TS.bak"
   info "backed up   $(tilde "$f") -> $(tilde "$f.aws_sso-$TS.bak")"
 }
 
@@ -238,7 +241,10 @@ install_file() {
     info "would install $(tilde "$dest")${priv:+ (with $priv)}"
     return 0
   fi
-  [ -e "$dest" ] && backup_file "$dest" "$priv"
+  # No backup: everything install_file writes is a file this package owns --
+  # the script, the shell functions, the completions -- so the previous copy is
+  # just an older release of the same thing. Startup files, which are yours and
+  # which we only edit a region of, are backed up by replace_file.
   # shellcheck disable=SC2086
   $priv install -m "$mode" "$src" "$dest"
   ok "installed   $(tilde "$dest")"
